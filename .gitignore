@@ -4,6 +4,10 @@ __pycache__/
 
 # Secrets / lokale Konfiguration
 .env
+# Google OAuth Client-Secret-Dateien (NIEMALS committen!)
+client_secret*.json
+*credentials*.json
+token.json
 
 # Laufzeit-Daten (gehören aufs Railway-Volume, nicht ins Repo)
 *.db
