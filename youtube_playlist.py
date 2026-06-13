@@ -24,11 +24,16 @@ _TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 class YouTubePlaylist:
-    def __init__(self, client_id: str, client_secret: str, refresh_token: str, playlist_id: str):
+    def __init__(self, client_id: str, client_secret: str, refresh_token: str,
+                 playlist_id: str, insert_position: Optional[int] = 0):
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_token = refresh_token
         self.playlist_id = playlist_id
+        # Position, an der neue Songs in die Playlist kommen:
+        #   0    = ganz vorne (als Naechstes) [Standard]
+        #   None = ans Ende (API-Standardverhalten)
+        self.insert_position = insert_position
         self._access_token: Optional[str] = None
         self._expires_at: float = 0.0
 
@@ -39,8 +44,16 @@ class YouTubePlaylist:
         secret = os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip()
         refresh = os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip()
         playlist = os.environ.get("YOUTUBE_PLAYLIST_ID", "").strip()
+        pos_raw = os.environ.get("YOUTUBE_INSERT_POSITION", "0").strip().lower()
+        if pos_raw in ("", "end", "ende", "none"):
+            position = None  # ans Ende
+        else:
+            try:
+                position = max(0, int(pos_raw))
+            except ValueError:
+                position = 0
         if cid and secret and refresh and playlist:
-            return cls(cid, secret, refresh, playlist)
+            return cls(cid, secret, refresh, playlist, insert_position=position)
         return None
 
     async def _get_access_token(self) -> Optional[str]:
@@ -73,23 +86,39 @@ class YouTubePlaylist:
         token = await self._get_access_token()
         if not token:
             return None
-        body = {
-            "snippet": {
-                "playlistId": self.playlist_id,
-                "resourceId": {"kind": "youtube#video", "videoId": video_id},
-            }
+        snippet = {
+            "playlistId": self.playlist_id,
+            "resourceId": {"kind": "youtube#video", "videoId": video_id},
         }
+        if self.insert_position is not None:
+            snippet["position"] = self.insert_position
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{_API_BASE}?part=snippet",
-                    json=body,
+                    json={"snippet": snippet},
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=_TIMEOUT,
                 ) as resp:
                     if resp.status in (200, 201):
                         j = await resp.json()
                         return j.get("id")
+                    # Position evtl. ungueltig (z.B. groesser als Playlist) ->
+                    # einmal ohne Position erneut versuchen (ans Ende).
+                    if "position" in snippet:
+                        snippet.pop("position")
+                        async with session.post(
+                            f"{_API_BASE}?part=snippet",
+                            json={"snippet": snippet},
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=_TIMEOUT,
+                        ) as resp2:
+                            if resp2.status in (200, 201):
+                                j = await resp2.json()
+                                return j.get("id")
+                            txt = await resp2.text()
+                            print(f"[YT] Insert-Fehler {resp2.status}: {txt[:300]}")
+                            return None
                     txt = await resp.text()
                     print(f"[YT] Insert-Fehler {resp.status}: {txt[:300]}")
                     return None
