@@ -8,6 +8,7 @@ __pycache__/
 client_secret*.json
 *credentials*.json
 token.json
+refresh_token.txt
 
 # Laufzeit-Daten (gehören aufs Railway-Volume, nicht ins Repo)
 *.db
