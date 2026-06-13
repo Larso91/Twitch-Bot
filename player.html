@@ -40,13 +40,55 @@ function setInfo(title, req) {
     : "Warte auf Songs &hellip;";
 }
 
-// YouTube IFrame API
+// ---- Steuerung ----
+function togglePlay() {
+  if (!player || !player.getPlayerState) return;
+  player.getPlayerState() === YT.PlayerState.PLAYING
+    ? player.pauseVideo() : player.playVideo();
+}
+function restartSong() {
+  try { player.seekTo(0, true); player.playVideo(); } catch (e) {}
+}
+function skipSong() { finishCurrent(); }
+
+// Tastatur-Shortcuts (greifen, wenn dieses Fenster im Vordergrund ist)
+document.addEventListener("keydown", (e) => {
+  switch (e.code) {
+    case "Space": case "KeyK": e.preventDefault(); togglePlay(); break;
+    case "ArrowRight": case "KeyN": skipSong(); break;
+    case "ArrowLeft": restartSong(); break;
+  }
+});
+
+// Echte Medientasten (Play/Pause global ueber den YouTube-Player)
+function setupMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    navigator.mediaSession.setActionHandler("play", () => player.playVideo());
+    navigator.mediaSession.setActionHandler("pause", () => player.pauseVideo());
+    navigator.mediaSession.setActionHandler("stop", () => player.pauseVideo());
+    navigator.mediaSession.setActionHandler("nexttrack", () => skipSong());
+    navigator.mediaSession.setActionHandler("previoustrack", () => restartSong());
+  } catch (e) {}
+}
+function updateMediaMetadata(title, req) {
+  if (!("mediaSession" in navigator) || !window.MediaMetadata) return;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: title || "Song Request Player",
+      artist: req ? "@" + req : "",
+      album: "Songrequests",
+    });
+  } catch (e) {}
+}
+
+// ---- YouTube IFrame API ----
 function onYouTubeIframeAPIReady() {
   player = new YT.Player("player", {
     width: "100%", height: "100%",
     playerVars: { autoplay: 1, controls: 1, modestbranding: 1, rel: 0, playsinline: 1 },
     events: {
-      onReady: () => { ready = true; poll(); setInterval(poll, POLL_MS); },
+      onReady: () => { ready = true; setupMediaSession(); poll(); setInterval(poll, POLL_MS); },
       onStateChange: onState,
       onError: () => finishCurrent(),  // nicht abspielbar -> ueberspringen
     },
@@ -71,6 +113,7 @@ async function poll() {
     if (cur.id !== currentId) {
       currentId = cur.id;
       setInfo(cur.title, cur.requester);
+      updateMediaMetadata(cur.title, cur.requester);
       if (cur.video_id) player.loadVideoById(cur.video_id);
     }
   } catch (e) { setStatus("Verbindungsfehler"); }
@@ -92,9 +135,6 @@ async function finishCurrent() {
 document.getElementById("overlay").addEventListener("click", () => {
   document.getElementById("overlay").style.display = "none";
   if (player && player.playVideo) player.playVideo();
-});
-window.addEventListener("load", () => {
-  // In OBS ist Autoplay erlaubt; der Hinweis stoert dort nicht (kein Klick noetig).
 });
 </script>
 <script src="https://www.youtube.com/iframe_api"></script>

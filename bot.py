@@ -191,6 +191,8 @@ class Bot(commands.Bot):
         app.router.add_get("/player", self._h_player)
         app.router.add_get("/api/queue", self._h_queue)
         app.router.add_post("/api/finished", self._h_finished)
+        app.router.add_post("/api/skip", self._h_skip)
+        app.router.add_get("/api/skip", self._h_skip)  # bequem fuer Hotkey-Tools
         app.router.add_get("/healthz", lambda r: web.Response(text="ok"))
         runner = web.AppRunner(app)
         await runner.setup()
@@ -247,6 +249,15 @@ class Bot(commands.Bot):
             await self._remove_from_yt(song)
             return web.json_response({"ok": True, "removed": fid})
         return web.json_response({"ok": False, "reason": "not-current"})
+
+    async def _h_skip(self, request):
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        song = self.db.remove_first()
+        if song:
+            await self._remove_from_yt(song)
+            return web.json_response({"ok": True, "skipped": song["id"], "title": song["title"]})
+        return web.json_response({"ok": False, "reason": "empty"})
 
     def _write_streamlist_file(self):
         """Schreibt die komplette Streamliste in eine wachsende Textdatei."""

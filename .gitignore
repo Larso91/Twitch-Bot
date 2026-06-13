@@ -9,6 +9,8 @@ client_secret*.json
 *credentials*.json
 token.json
 refresh_token.txt
+# Persoenliches Hotkey-Skript mit Token (Vorlage: skip.ahk.example)
+skip.ahk
 
 # Laufzeit-Daten (gehören aufs Railway-Volume, nicht ins Repo)
 *.db

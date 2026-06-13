@@ -1,0 +1,29 @@
+#Requires AutoHotkey v2.0
+; ------------------------------------------------------------------
+; Globaler Song-Skip fuer den Twitch-Bot Web-Player (Vorlage).
+; Kopiere diese Datei zu "skip.ahk" und trage unten deine Domain + Token ein.
+; Druecke dann die "Weiter/Next"-Medientaste -> aktueller Song wird uebersprungen.
+;
+; Benoetigt AutoHotkey v2 (https://www.autohotkey.com/).
+; Autostart: Verknuepfung in den Autostart-Ordner legen (Win+R -> shell:startup).
+; ------------------------------------------------------------------
+
+SkipURL := "https://DEINE-RAILWAY-DOMAIN/api/skip?token=DEIN_TOKEN"
+
+; Skip-Taste = "Next Track"-Medientaste:
+Media_Next::SkipSong()
+
+; Alternative Taste (auskommentiert) - z.B. Strg+Alt+Pfeil-rechts:
+; ^!Right::SkipSong()
+
+SkipSong() {
+    global SkipURL
+    try {
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.Open("GET", SkipURL, false)
+        req.Send()
+    }
+}
+
+; Hinweis: Play/Pause musst du hier NICHT mappen - die Play/Pause-Medientaste
+; steuert den YouTube-Player im Browser bereits direkt (global).
