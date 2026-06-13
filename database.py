@@ -16,12 +16,13 @@ class Database:
         with self._conn() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS queue (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url       TEXT NOT NULL,
-                    title     TEXT NOT NULL,
-                    requester TEXT NOT NULL,
-                    sort_key  REAL,
-                    added_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url        TEXT NOT NULL,
+                    title      TEXT NOT NULL,
+                    requester  TEXT NOT NULL,
+                    sort_key   REAL,
+                    yt_item_id TEXT,
+                    added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 -- Dauerhafte Streamliste: jeder jemals requestete Song,
                 -- wächst stätig und wird nie automatisch geleert.
@@ -45,6 +46,8 @@ class Database:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(queue)")}
         if "sort_key" not in cols:
             conn.execute("ALTER TABLE queue ADD COLUMN sort_key REAL")
+        if "yt_item_id" not in cols:
+            conn.execute("ALTER TABLE queue ADD COLUMN yt_item_id TEXT")
         # Alte Einträge ohne sort_key in Einfügereihenfolge auffüllen.
         conn.execute(
             "UPDATE queue SET sort_key = id WHERE sort_key IS NULL"
@@ -52,8 +55,8 @@ class Database:
 
     # --- Queue ---
 
-    def add_song(self, url: str, title: str, requester: str) -> int:
-        """Song hinzufügen.
+    def add_song(self, url: str, title: str, requester: str):
+        """Song hinzufügen. Gibt (song_id, position) zurück.
 
         Der neue Song wird direkt hinter dem aktuell laufenden (ersten) Song
         eingereiht, spielt also als Nächstes. Zusätzlich wird er dauerhaft in
@@ -74,10 +77,11 @@ class Database:
                 # Zwischen aktuellem Song (keys[0]) und dem danach einsortieren.
                 new_key = (keys[0] + keys[1]) / 2.0
 
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO queue (url, title, requester, sort_key) VALUES (?, ?, ?, ?)",
                 (url, title, requester, new_key),
             )
+            song_id = cur.lastrowid
             conn.execute(
                 "INSERT INTO streamlist (url, title, requester) VALUES (?, ?, ?)",
                 (url, title, requester),
@@ -87,10 +91,18 @@ class Database:
             ordered = conn.execute(
                 "SELECT sort_key FROM queue ORDER BY sort_key ASC, id ASC"
             ).fetchall()
+            position = len(ordered)
             for i, r in enumerate(ordered):
                 if r["sort_key"] == new_key:
-                    return i + 1
-            return len(ordered)
+                    position = i + 1
+                    break
+            return song_id, position
+
+    def set_yt_item_id(self, song_id: int, item_id: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE queue SET yt_item_id = ? WHERE id = ?", (item_id, song_id)
+            )
 
     def get_queue(self) -> List[Dict]:
         with self._conn() as conn:

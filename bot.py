@@ -7,6 +7,7 @@ from chat import ChatExtras
 from database import Database
 from emotes import fetch_channel_emote_names, twitch_emote_names
 from jokes import get_random_joke
+from youtube_playlist import YouTubePlaylist
 from youtube import (
     extract_video_id,
     get_video_duration,
@@ -37,6 +38,8 @@ class Bot(commands.Bot):
         )
         self._emotes_loaded = False
         self._room_id = None
+        # YouTube-Playlist-Sync (nur aktiv, wenn OAuth-Daten gesetzt sind).
+        self.yt_playlist = YouTubePlaylist.from_env()
 
     async def event_ready(self):
         print(f"Bot gestartet: {self.nick}")
@@ -48,6 +51,10 @@ class Bot(commands.Bot):
             print("Längencheck:   INAKTIV (kein YOUTUBE_API_KEY gesetzt)")
         print(f"Witze-Interval:{self.joke_interval // 60} Min.")
         print(f"Zufallsantworten: {int(self.chat.reply_chance * 100)}% | Combo ab {self.chat.combo_threshold}")
+        if self.yt_playlist:
+            print("YT-Playlist:   AKTIV (Songrequests werden synchronisiert)")
+        else:
+            print("YT-Playlist:   INAKTIV (keine OAuth-Daten gesetzt)")
         asyncio.create_task(self._joke_loop())
 
     async def event_message(self, message):
@@ -140,13 +147,31 @@ class Bot(commands.Bot):
                 )
                 return
 
-        position = self.db.add_song(url, info["title"], ctx.author.name)
+        song_id, position = self.db.add_song(url, info["title"], ctx.author.name)
         self._write_streamlist_file()
+
+        # In die echte YouTube-Playlist eintragen (falls aktiviert).
+        yt_note = ""
+        if self.yt_playlist and video_id:
+            item_id = await self.yt_playlist.add(video_id)
+            if item_id:
+                self.db.set_yt_item_id(song_id, item_id)
+            else:
+                yt_note = " (Hinweis: konnte nicht zur YouTube-Playlist hinzugefügt werden)"
+
         if position <= 1:
             hint = "spielt als Nächstes"
         else:
             hint = f"spielt als Nächstes (Platz #{position})"
-        await ctx.send(f"@{ctx.author.name} Hinzugefügt — {hint}: {info['title']}")
+        await ctx.send(f"@{ctx.author.name} Hinzugefügt — {hint}: {info['title']}{yt_note}")
+
+    async def _remove_from_yt(self, song):
+        """Entfernt einen Song aus der YouTube-Playlist (falls aktiviert)."""
+        if self.yt_playlist and song and song.get("yt_item_id"):
+            try:
+                await self.yt_playlist.remove(song["yt_item_id"])
+            except Exception as e:
+                print(f"YT-Playlist remove fehlgeschlagen: {e}")
 
     def _write_streamlist_file(self):
         """Schreibt die komplette Streamliste in eine wachsende Textdatei."""
@@ -170,6 +195,7 @@ class Bot(commands.Bot):
             await ctx.send(f"@{ctx.author.name} Du hast keinen Song in der Queue.")
             return
         self.db.remove_by_id(song["id"])
+        await self._remove_from_yt(song)
         await ctx.send(f"@{ctx.author.name} Song entfernt: {song['title']}")
 
     @commands.command(name="queue", aliases=["q"])
@@ -213,6 +239,7 @@ class Bot(commands.Bot):
             return
         song = self.db.remove_first()
         if song:
+            await self._remove_from_yt(song)
             await ctx.send(f"Übersprungen: {song['title']}")
         else:
             await ctx.send("Die Queue ist leer.")
@@ -236,13 +263,17 @@ class Bot(commands.Bot):
             await ctx.send(f"@{ctx.author.name} Du kannst nur deine eigenen Songs entfernen.")
             return
         self.db.remove_by_id(song["id"])
+        await self._remove_from_yt(song)
         await ctx.send(f"@{ctx.author.name} Entfernt: {song['title']}")
 
     @commands.command(name="clearqueue", aliases=["clearsr"])
     async def clearqueue(self, ctx: commands.Context):
         if not (ctx.author.is_mod or ctx.author.is_broadcaster):
             return
+        songs = self.db.get_queue()
         count = self.db.clear_queue()
+        for song in songs:
+            await self._remove_from_yt(song)
         await ctx.send(f"Queue geleert. {count} Song(s) entfernt.")
 
     # ------------------------------------------------------------------ #
