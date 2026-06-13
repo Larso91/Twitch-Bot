@@ -23,7 +23,7 @@ class Bot(commands.Bot):
             prefix="!",
             initial_channels=[os.environ["TWITCH_CHANNEL"]],
         )
-        self.db = Database()
+        self.db = Database(os.environ.get("DB_PATH", "queue.db"))
         self.channel_name = os.environ["TWITCH_CHANNEL"].lower()
         self.joke_interval = int(os.environ.get("JOKE_INTERVAL_MINUTES", "30")) * 60
         self.yt_api_key = os.environ.get("YOUTUBE_API_KEY", "")

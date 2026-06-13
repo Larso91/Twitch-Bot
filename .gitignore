@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Secrets / lokale Konfiguration
+.env
+
+# Laufzeit-Daten (gehören aufs Railway-Volume, nicht ins Repo)
+*.db
+queue.db
+streamlist.txt
