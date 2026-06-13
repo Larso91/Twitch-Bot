@@ -1,6 +1,7 @@
 import asyncio
 import os
 
+from aiohttp import web
 from twitchio.ext import commands
 
 from chat import ChatExtras
@@ -40,6 +41,9 @@ class Bot(commands.Bot):
         self._room_id = None
         # YouTube-Playlist-Sync (nur aktiv, wenn OAuth-Daten gesetzt sind).
         self.yt_playlist = YouTubePlaylist.from_env()
+        # Web-Player (OBS-Browser-Quelle).
+        self.player_token = os.environ.get("PLAYER_TOKEN", "").strip()
+        self._web_started = False
 
     async def event_ready(self):
         print(f"Bot gestartet: {self.nick}")
@@ -56,6 +60,9 @@ class Bot(commands.Bot):
         else:
             print("YT-Playlist:   INAKTIV (keine OAuth-Daten gesetzt)")
         asyncio.create_task(self._joke_loop())
+        if not self._web_started:
+            self._web_started = True
+            asyncio.create_task(self._start_web())
 
     async def event_message(self, message):
         if message.echo:
@@ -172,6 +179,74 @@ class Bot(commands.Bot):
                 await self.yt_playlist.remove(song["yt_item_id"])
             except Exception as e:
                 print(f"YT-Playlist remove fehlgeschlagen: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Web-Player (OBS-Browser-Quelle)
+    # ------------------------------------------------------------------ #
+
+    async def _start_web(self):
+        port = int(os.environ.get("PORT", "8080"))
+        app = web.Application()
+        app.router.add_get("/", self._h_root)
+        app.router.add_get("/player", self._h_player)
+        app.router.add_get("/api/queue", self._h_queue)
+        app.router.add_post("/api/finished", self._h_finished)
+        app.router.add_get("/healthz", lambda r: web.Response(text="ok"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        guard = "mit Token-Schutz" if self.player_token else "OHNE Token (PLAYER_TOKEN setzen!)"
+        print(f"Web-Player:    laeuft auf Port {port} -> /player ({guard})")
+
+    def _check_token(self, request) -> bool:
+        if not self.player_token:
+            return True  # kein Token gesetzt -> offen (nur fuer Tests empfohlen)
+        return request.query.get("token") == self.player_token
+
+    def _song_json(self, song):
+        return {
+            "id": song["id"],
+            "title": song["title"],
+            "requester": song["requester"],
+            "url": song["url"],
+            "video_id": extract_video_id(song["url"]),
+        }
+
+    async def _h_root(self, request):
+        return web.Response(
+            text="Twitch-Bot laeuft. Player unter /player?token=DEIN_TOKEN",
+            content_type="text/plain",
+        )
+
+    async def _h_player(self, request):
+        try:
+            with open("player.html", encoding="utf-8") as f:
+                html = f.read()
+        except FileNotFoundError:
+            return web.Response(text="player.html nicht gefunden", status=500)
+        return web.Response(text=html, content_type="text/html")
+
+    async def _h_queue(self, request):
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        songs = self.db.get_queue()
+        out = [self._song_json(s) for s in songs]
+        return web.json_response({"current": out[0] if out else None, "queue": out})
+
+    async def _h_finished(self, request):
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            fid = int(request.query.get("id", "0"))
+        except ValueError:
+            fid = 0
+        first = self.db.get_first()
+        if first and first["id"] == fid:
+            song = self.db.remove_first()
+            await self._remove_from_yt(song)
+            return web.json_response({"ok": True, "removed": fid})
+        return web.json_response({"ok": False, "reason": "not-current"})
 
     def _write_streamlist_file(self):
         """Schreibt die komplette Streamliste in eine wachsende Textdatei."""
