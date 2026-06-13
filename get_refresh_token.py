@@ -15,6 +15,7 @@ gehört, und bestätige den Zugriff. Bei der Warnung "App nicht verifiziert":
 ausgegeben -> in Railway als YOUTUBE_REFRESH_TOKEN hinterlegen.
 """
 
+import glob
 import http.server
 import json
 import socket
@@ -27,6 +28,24 @@ AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 
+def _load_credentials():
+    """Liest Client ID/Secret aus einer client_secret*.json im Ordner, sonst per Eingabe."""
+    files = glob.glob("client_secret*.json") + glob.glob("*credentials*.json")
+    if files:
+        try:
+            with open(files[0], encoding="utf-8") as f:
+                data = json.load(f)
+            section = data.get("installed") or data.get("web") or {}
+            cid = section.get("client_id", "").strip()
+            secret = section.get("client_secret", "").strip()
+            if cid and secret:
+                print(f"Credentials geladen aus: {files[0]}")
+                return cid, secret
+        except Exception as e:
+            print(f"Konnte {files[0]} nicht lesen ({e}), bitte manuell eingeben.")
+    return input("Client ID: ").strip(), input("Client Secret: ").strip()
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("localhost", 0))
@@ -36,8 +55,7 @@ def _free_port() -> int:
 
 
 def main():
-    client_id = input("Client ID: ").strip()
-    client_secret = input("Client Secret: ").strip()
+    client_id, client_secret = _load_credentials()
     if not client_id or not client_secret:
         print("Client ID und Secret sind erforderlich.")
         return
