@@ -57,12 +57,15 @@ class YouTubePlaylist:
             async with aiohttp.ClientSession() as session:
                 async with session.post(_TOKEN_URL, data=data, timeout=_TIMEOUT) as resp:
                     if resp.status != 200:
+                        txt = await resp.text()
+                        print(f"[YT] Token-Fehler {resp.status}: {txt[:200]}")
                         return None
                     j = await resp.json()
                     self._access_token = j.get("access_token")
                     self._expires_at = time.time() + int(j.get("expires_in", 3600))
                     return self._access_token
-        except Exception:
+        except Exception as e:
+            print(f"[YT] Token-Ausnahme: {e}")
             return None
 
     async def add(self, video_id: str) -> Optional[str]:
@@ -87,8 +90,11 @@ class YouTubePlaylist:
                     if resp.status in (200, 201):
                         j = await resp.json()
                         return j.get("id")
+                    txt = await resp.text()
+                    print(f"[YT] Insert-Fehler {resp.status}: {txt[:300]}")
                     return None
-        except Exception:
+        except Exception as e:
+            print(f"[YT] Insert-Ausnahme: {e}")
             return None
 
     async def remove(self, item_id: str) -> bool:
