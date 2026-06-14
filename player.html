@@ -26,11 +26,12 @@
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
-const POLL_MS = 3000;        // Playlist auf Aenderungen pruefen (snappy Skip)
+const POLL_MS = 3000;
 let player, ready = false;
-let items = [];              // [{item_id, video_id, title, requester}] in Reihenfolge
-let currentItemId = null;
-const recentlyRemoved = new Set();   // verhindert Wiederauftauchen wegen API-Latenz
+let items = [];              // persistente Playlist [{item_id, video_id, title, requester}]
+let currentVid = null;       // video_id des laufenden Songs
+let currentIdx = 0;          // Index des laufenden Songs (Fallback bei Listenaenderung)
+let lastSkipSeq = null;      // zuletzt gesehener Skip-Zaehler vom Server
 
 function api(path) {
   const sep = path.includes("?") ? "&" : "?";
@@ -38,16 +39,18 @@ function api(path) {
 }
 function setStatus(t) { document.getElementById("status").textContent = t; }
 
+function indexOfCurrent() {
+  return items.findIndex((it) => it.video_id === currentVid);
+}
 function setInfo() {
-  const it = items[0];
+  const it = items[indexOfCurrent()];
   document.getElementById("info").innerHTML = it
     ? it.title + (it.requester ? ' <span class="req">— @' + it.requester + "</span>" : "")
     : "Warte auf Songs &hellip;";
 }
-
 function updateMediaMetadata() {
   if (!("mediaSession" in navigator) || !window.MediaMetadata) return;
-  const it = items[0];
+  const it = items[indexOfCurrent()];
   try {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: it ? it.title : "Song Request Player",
@@ -57,20 +60,39 @@ function updateMediaMetadata() {
   } catch (e) {}
 }
 
+// ---- Wiedergabe per Index; nichts wird geloescht; am Ende -> Loop ----
+function playAt(i) {
+  if (!items.length) {
+    currentVid = null;
+    try { player.stopVideo(); } catch (e) {}
+    setInfo();
+    return;
+  }
+  i = ((i % items.length) + items.length) % items.length;
+  currentIdx = i;
+  currentVid = items[i].video_id;
+  player.loadVideoById(items[i].video_id);
+  setInfo();
+  updateMediaMetadata();
+}
+function advance() {
+  if (!items.length) return;
+  const ci = indexOfCurrent();
+  playAt(ci >= 0 ? ci + 1 : currentIdx);   // Loop ueber Modulo in playAt
+}
+function restartSong() { try { player.seekTo(0, true); player.playVideo(); } catch (e) {} }
+
 // ---- Steuerung: NUR Medientasten ----
-// Play/Pause uebernimmt YouTube global selbst (eigene Media-Session des iframes).
-// Next-Track wird zusaetzlich global per AutoHotkey -> /api/skip abgefangen.
 function setupMediaSession() {
   if (!("mediaSession" in navigator)) return;
   try {
     navigator.mediaSession.setActionHandler("play", () => player.playVideo());
     navigator.mediaSession.setActionHandler("pause", () => player.pauseVideo());
     navigator.mediaSession.setActionHandler("stop", () => player.pauseVideo());
-    navigator.mediaSession.setActionHandler("nexttrack", () => finishCurrent());
+    navigator.mediaSession.setActionHandler("nexttrack", () => advance());
     navigator.mediaSession.setActionHandler("previoustrack", () => restartSong());
   } catch (e) {}
 }
-function restartSong() { try { player.seekTo(0, true); player.playVideo(); } catch (e) {} }
 
 // ---- YouTube IFrame API ----
 function onYouTubeIframeAPIReady() {
@@ -83,53 +105,22 @@ function onYouTubeIframeAPIReady() {
         setupMediaSession();
         refresh();
         setInterval(refresh, POLL_MS);
-        setInterval(reportNow, 2000);   // Position/Dauer ans Overlay melden
+        setInterval(reportNow, 2000);
       },
       onStateChange: onState,
-      onError: () => finishCurrent(),   // nicht abspielbar -> entfernen & weiter
+      // nicht abspielbar (privat/geloescht) -> ueberspringen (nicht loeschen).
+      // Kleiner Delay, damit es bei mehreren defekten Songs keine Hot-Loop gibt.
+      onError: () => setTimeout(advance, 800),
     },
   });
 }
-
 function onState(e) {
-  if (e.data === YT.PlayerState.ENDED) finishCurrent();
+  if (e.data === YT.PlayerState.ENDED) advance();   // Songende -> naechster, ohne Loeschen
 }
 
-function loadCurrent() {
-  if (!items.length) {
-    if (currentItemId !== null) { try { player.stopVideo(); } catch (e) {} }
-    currentItemId = null;
-    setInfo();
-    return;
-  }
-  const it = items[0];
-  if (it.item_id === currentItemId) return;   // laeuft bereits -> nicht unterbrechen
-  currentItemId = it.item_id;
-  player.loadVideoById(it.video_id);
-  setInfo();
-  updateMediaMetadata();
-}
-
-// Aktuellen Song als fertig markieren: aus der YouTube-Playlist entfernen & weiter.
-async function finishCurrent() {
-  if (!currentItemId) return;
-  const removeId = currentItemId;
-  recentlyRemoved.add(removeId);
-  setTimeout(() => recentlyRemoved.delete(removeId), 30000);
-  items = items.filter((it) => it.item_id !== removeId);
-  currentItemId = null;
-  try {
-    await fetch(api("/api/playlist/remove?item_id=" + encodeURIComponent(removeId)),
-      { method: "POST" });
-  } catch (e) {}
-  loadCurrent();
-}
-
-// Aktuelle Wiedergabe-Position an den Bot melden (fuer das OBS-Overlay).
+// Position/Dauer ans Overlay melden.
 async function reportNow() {
-  if (!ready || !currentItemId) return;
-  const it = items[0];
-  if (!it) return;
+  if (!ready || currentVid == null) return;
   let pos = 0, dur = 0, playing = false;
   try { pos = player.getCurrentTime() || 0; } catch (e) {}
   try { dur = player.getDuration() || 0; } catch (e) {}
@@ -138,7 +129,7 @@ async function reportNow() {
     await fetch(api("/api/nowplaying"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ video_id: it.video_id, position: pos, duration: dur, playing }),
+      body: JSON.stringify({ video_id: currentVid, position: pos, duration: dur, playing }),
     });
   } catch (e) {}
 }
@@ -157,12 +148,27 @@ async function refresh() {
       return;
     }
 
-    items = (data.items || [])
-      .filter((it) => it.video_id && !recentlyRemoved.has(it.item_id));
-    setStatus(items.length ? "In Queue: " + items.length : "Playlist leer");
-    loadCurrent();
-    setInfo();
-    updateMediaMetadata();
+    items = (data.items || []).filter((it) => it.video_id);
+    setStatus(items.length ? "Songs: " + items.length : "Playlist leer");
+
+    // Skip-Signal vom Server (!skip / Media_Next via AHK).
+    if (lastSkipSeq === null) {
+      lastSkipSeq = data.skip_seq;
+    } else if (data.skip_seq !== lastSkipSeq) {
+      lastSkipSeq = data.skip_seq;
+      advance();
+      return;
+    }
+
+    if (!items.length) { currentVid = null; setInfo(); return; }
+
+    if (currentVid === null) {
+      playAt(0);                 // Erststart
+    } else if (indexOfCurrent() === -1) {
+      playAt(currentIdx);        // laufender Song wurde entfernt -> an gleicher Stelle weiter
+    } else {
+      setInfo();                 // laeuft weiter -> nicht unterbrechen
+    }
   } catch (e) { setStatus("Verbindungsfehler"); }
 }
 

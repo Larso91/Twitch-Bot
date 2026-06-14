@@ -50,6 +50,9 @@ class Bot(commands.Bot):
         self._pl_sync_seconds = int(os.environ.get("PLAYLIST_SYNC_SECONDS", "300"))
         # Wiedergabe-Status vom Player gemeldet (fuer das OBS-Overlay/Restzeit).
         self._now = None  # {video_id, position, duration, playing, ts}
+        # Skip-Signal: wird bei !skip / Media_Next hochgezaehlt; der Player
+        # springt dann zum naechsten Song, OHNE ihn aus der Playlist zu loeschen.
+        self._skip_seq = 0
         # Web-Player (OBS-Browser-Quelle).
         self.player_token = os.environ.get("PLAYER_TOKEN", "").strip()
         self._web_started = False
@@ -168,22 +171,22 @@ class Bot(commands.Bot):
         song_id, position = self.db.add_song(url, info["title"], ctx.author.name)
         self._write_streamlist_file()
 
-        # In die echte YouTube-Playlist eintragen (falls aktiviert).
+        # In die echte YouTube-Playlist eintragen (falls aktiviert) – direkt
+        # HINTER dem aktuell laufenden Song, damit der Request als Naechstes laeuft.
         yt_note = ""
         if self.yt_playlist and video_id:
-            item_id = await self.yt_playlist.add(video_id)
+            pos = self._insert_position()
+            item_id = await self.yt_playlist.add(video_id, position=pos)
             if item_id:
                 self.db.set_yt_item_id(song_id, item_id)
                 # Sofort ins In-Memory-Abbild, damit der Player es direkt sieht.
-                self._pl_add(item_id, video_id, info["title"], ctx.author.name, url)
+                self._pl_insert(pos, item_id, video_id, info["title"], ctx.author.name, url)
             else:
                 yt_note = " (Hinweis: konnte nicht zur YouTube-Playlist hinzugefügt werden)"
 
-        if position <= 1:
-            hint = "spielt als Nächstes"
-        else:
-            hint = f"spielt als Nächstes (Platz #{position})"
-        await ctx.send(f"@{ctx.author.name} Hinzugefügt — {hint}: {info['title']}{yt_note}")
+        await ctx.send(
+            f"@{ctx.author.name} Hinzugefügt — spielt als Nächstes: {info['title']}{yt_note}"
+        )
 
     async def _remove_from_yt(self, song):
         """Entfernt einen Song aus der YouTube-Playlist (falls aktiviert)."""
@@ -230,17 +233,38 @@ class Bot(commands.Bot):
         self._pl = merged
         print(f"Playlist synchronisiert: {len(merged)} Song(s)")
 
-    def _pl_add(self, item_id, video_id, title, requester, url):
-        """Neuen Song lokal ans Ende der Playlist anhaengen (YOUTUBE_INSERT_POSITION=end)."""
-        self._pl.append(
-            {
-                "item_id": item_id,
-                "video_id": video_id,
-                "title": title,
-                "requester": requester,
-                "url": url,
-            }
-        )
+    def _pl_insert(self, pos, item_id, video_id, title, requester, url):
+        """Neuen Song lokal an Position `pos` einfuegen (None/zu gross = ans Ende)."""
+        entry = {
+            "item_id": item_id,
+            "video_id": video_id,
+            "title": title,
+            "requester": requester,
+            "url": url,
+        }
+        if pos is None or pos >= len(self._pl):
+            self._pl.append(entry)
+        else:
+            self._pl.insert(max(0, pos), entry)
+
+    def _current_index(self):
+        """Index des aktuell laufenden Songs im In-Memory-Abbild (per Player-Meldung)."""
+        now = self._now
+        vid = now.get("video_id") if now else None
+        if vid:
+            for i, x in enumerate(self._pl):
+                if x["video_id"] == vid:
+                    return i
+        return -1
+
+    def _insert_position(self):
+        """Position fuer einen neuen Request: direkt hinter dem laufenden Song."""
+        if not self._pl:
+            return 0
+        ci = self._current_index()
+        if ci >= 0:
+            return ci + 1
+        return 1  # laeuft gerade nichts Bekanntes -> hinter den ersten Song
 
     async def _remove_playlist_item(self, item_id):
         """Entfernt einen Eintrag aus YouTube-Playlist, In-Memory-Abbild und SQLite."""
@@ -374,7 +398,10 @@ class Bot(commands.Bot):
         """Liefert den aktuellen Song + (falls bekannt) verstrichene Zeit/Dauer."""
         if not self._check_token(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        cur = self._pl[0] if (self.yt_playlist and self._pl) else None
+        cur = None
+        if self.yt_playlist and self._pl:
+            ci = self._current_index()
+            cur = self._pl[ci] if ci >= 0 else self._pl[0]
         out = {
             "title": cur["title"] if cur else None,
             "requester": cur.get("requester") if cur else None,
@@ -424,7 +451,11 @@ class Bot(commands.Bot):
             if x.get("video_id")
         ]
         return web.json_response(
-            {"playlist_id": self.yt_playlist.playlist_id, "items": items}
+            {
+                "playlist_id": self.yt_playlist.playlist_id,
+                "items": items,
+                "skip_seq": self._skip_seq,
+            }
         )
 
     async def _h_playlist_remove(self, request):
@@ -452,15 +483,15 @@ class Bot(commands.Bot):
         return web.json_response({"ok": False, "reason": "not-current"})
 
     async def _h_skip(self, request):
-        """Globaler Skip (Media_Next via AHK): ersten Song der Playlist entfernen."""
+        """Globaler Skip (Media_Next via AHK): zum naechsten Song springen.
+
+        Loescht NICHT aus der Playlist – der Song bleibt erhalten und kommt in
+        der Rotation wieder. Entfernen geht nur ueber !wrongsong/!remove/!clearqueue.
+        """
         if not self._check_token(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        view = self._queue_view()
-        if not view:
-            return web.json_response({"ok": False, "reason": "empty"})
-        entry = view[0]
-        await self._queue_remove(entry)
-        return web.json_response({"ok": True, "title": entry["title"]})
+        self._skip_seq += 1
+        return web.json_response({"ok": True, "skip_seq": self._skip_seq})
 
     def _write_streamlist_file(self):
         """Schreibt die komplette Streamliste in eine wachsende Textdatei."""
@@ -522,7 +553,8 @@ class Bot(commands.Bot):
         if not view:
             await ctx.send("Aktuell kein Song in der Queue.")
             return
-        cur = view[0]
+        ci = self._current_index() if self.yt_playlist else 0
+        cur = view[ci] if 0 <= ci < len(view) else view[0]
         await ctx.send(
             f"Aktueller Song: {cur['title']} (von @{cur['requester'] or 'unbekannt'}) -> {cur['url']}"
         )
@@ -532,13 +564,12 @@ class Bot(commands.Bot):
         if not (ctx.author.is_mod or ctx.author.is_broadcaster):
             await ctx.send(f"@{ctx.author.name} Nur Mods können Songs überspringen.")
             return
-        view = self._queue_view()
-        if not view:
-            await ctx.send("Die Queue ist leer.")
+        if not self._pl:
+            await ctx.send("Die Playlist ist leer.")
             return
-        entry = view[0]
-        await self._queue_remove(entry)
-        await ctx.send(f"Übersprungen: {entry['title']}")
+        # Nur weiterspringen – der Song bleibt in der Playlist erhalten.
+        self._skip_seq += 1
+        await ctx.send("Übersprungen (nächster Song).")
 
     @commands.command(name="remove", aliases=["sr_remove"])
     async def remove(self, ctx: commands.Context, *, position: str = None):

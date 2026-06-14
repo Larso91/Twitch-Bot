@@ -21,6 +21,7 @@ import aiohttp
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _API_BASE = "https://www.googleapis.com/youtube/v3/playlistItems"
 _TIMEOUT = aiohttp.ClientTimeout(total=10)
+_UNSET = object()  # Sentinel: "kein position-Argument uebergeben"
 
 
 class YouTubePlaylist:
@@ -81,17 +82,22 @@ class YouTubePlaylist:
             print(f"[YT] Token-Ausnahme: {e}")
             return None
 
-    async def add(self, video_id: str) -> Optional[str]:
-        """Fügt ein Video zur Playlist hinzu. Gibt die playlistItem-ID zurück."""
+    async def add(self, video_id: str, position=_UNSET) -> Optional[str]:
+        """Fügt ein Video zur Playlist hinzu. Gibt die playlistItem-ID zurück.
+
+        `position` ueberschreibt die Standard-Einsortierung (z.B. fuer
+        'direkt hinter dem laufenden Song'). None = ans Ende.
+        """
         token = await self._get_access_token()
         if not token:
             return None
+        pos = self.insert_position if position is _UNSET else position
         snippet = {
             "playlistId": self.playlist_id,
             "resourceId": {"kind": "youtube#video", "videoId": video_id},
         }
-        if self.insert_position is not None:
-            snippet["position"] = self.insert_position
+        if pos is not None:
+            snippet["position"] = pos
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
