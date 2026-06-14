@@ -26,18 +26,49 @@
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
-const POLL_MS = 3000;
-let player, currentId = null, ready = false;
+const POLL_MS = 5000;        // wie oft die Playlist auf Aenderungen geprueft wird
+const LOOP = true;           // Playlist endlos wiederholen (keine Totzeit)
+let player, ready = false;
+let lastSig = "";            // Signatur der zuletzt geladenen Video-ID-Liste
+let titles = {};             // video_id -> Titel (aus der YouTube-Playlist)
 
 function api(path) {
   const sep = path.includes("?") ? "&" : "?";
   return path + sep + "token=" + encodeURIComponent(TOKEN);
 }
 function setStatus(t) { document.getElementById("status").textContent = t; }
-function setInfo(title, req) {
+
+function currentVideoId() {
+  try { const d = player.getVideoData(); return d && d.video_id; }
+  catch (e) { return null; }
+}
+
+function updateInfo() {
+  const vid = currentVideoId();
+  let title = (vid && titles[vid]) || "";
+  if (!title) { try { const d = player.getVideoData(); title = (d && d.title) || ""; } catch (e) {} }
+  let pos = "";
+  try {
+    const list = player.getPlaylist() || [];
+    const i = player.getPlaylistIndex();
+    if (list.length && i >= 0) pos = (i + 1) + " / " + list.length;
+  } catch (e) {}
   document.getElementById("info").innerHTML = title
-    ? title + ' <span class="req">— @' + req + "</span>"
+    ? title + (pos ? ' <span class="req">' + pos + "</span>" : "")
     : "Warte auf Songs &hellip;";
+}
+
+function updateMediaMetadata() {
+  if (!("mediaSession" in navigator) || !window.MediaMetadata) return;
+  const vid = currentVideoId();
+  let title = (vid && titles[vid]) || "";
+  if (!title) { try { const d = player.getVideoData(); title = (d && d.title) || ""; } catch (e) {} }
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: title || "Song Request Player",
+      album: "Songrequests",
+    });
+  } catch (e) {}
 }
 
 // ---- Steuerung ----
@@ -46,39 +77,26 @@ function togglePlay() {
   player.getPlayerState() === YT.PlayerState.PLAYING
     ? player.pauseVideo() : player.playVideo();
 }
-function restartSong() {
-  try { player.seekTo(0, true); player.playVideo(); } catch (e) {}
-}
-function skipSong() { finishCurrent(); }
+function restartSong() { try { player.seekTo(0, true); player.playVideo(); } catch (e) {} }
+function nextSong() { try { player.nextVideo(); } catch (e) {} }
+function prevSong() { try { player.previousVideo(); } catch (e) {} }
 
-// Tastatur-Shortcuts (greifen, wenn dieses Fenster im Vordergrund ist)
 document.addEventListener("keydown", (e) => {
   switch (e.code) {
     case "Space": case "KeyK": e.preventDefault(); togglePlay(); break;
-    case "ArrowRight": case "KeyN": skipSong(); break;
-    case "ArrowLeft": restartSong(); break;
+    case "ArrowRight": case "KeyN": nextSong(); break;
+    case "ArrowLeft": prevSong(); break;
   }
 });
 
-// Echte Medientasten (Play/Pause global ueber den YouTube-Player)
 function setupMediaSession() {
   if (!("mediaSession" in navigator)) return;
   try {
     navigator.mediaSession.setActionHandler("play", () => player.playVideo());
     navigator.mediaSession.setActionHandler("pause", () => player.pauseVideo());
     navigator.mediaSession.setActionHandler("stop", () => player.pauseVideo());
-    navigator.mediaSession.setActionHandler("nexttrack", () => skipSong());
-    navigator.mediaSession.setActionHandler("previoustrack", () => restartSong());
-  } catch (e) {}
-}
-function updateMediaMetadata(title, req) {
-  if (!("mediaSession" in navigator) || !window.MediaMetadata) return;
-  try {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: title || "Song Request Player",
-      artist: req ? "@" + req : "",
-      album: "Songrequests",
-    });
+    navigator.mediaSession.setActionHandler("nexttrack", () => nextSong());
+    navigator.mediaSession.setActionHandler("previoustrack", () => prevSong());
   } catch (e) {}
 }
 
@@ -88,47 +106,70 @@ function onYouTubeIframeAPIReady() {
     width: "100%", height: "100%",
     playerVars: { autoplay: 1, controls: 1, modestbranding: 1, rel: 0, playsinline: 1 },
     events: {
-      onReady: () => { ready = true; setupMediaSession(); poll(); setInterval(poll, POLL_MS); },
+      onReady: () => {
+        ready = true;
+        try { player.setLoop(LOOP); } catch (e) {}
+        setupMediaSession();
+        refresh();
+        setInterval(refresh, POLL_MS);
+        setInterval(() => { updateInfo(); updateMediaMetadata(); }, 1000);
+      },
       onStateChange: onState,
-      onError: () => finishCurrent(),  // nicht abspielbar -> ueberspringen
+      onError: () => nextSong(),   // nicht abspielbar (privat/gesperrt) -> ueberspringen
     },
   });
 }
 
-async function poll() {
+function onState(e) {
+  if (e.data === YT.PlayerState.ENDED) {
+    // Playlist-Ende -> neu laden, damit neue Requests auftauchen.
+    if (!LOOP) refresh();
+  }
+}
+
+async function refresh() {
   if (!ready) return;
   try {
-    const r = await fetch(api("/api/queue"), { cache: "no-store" });
+    const r = await fetch(api("/api/playlist"), { cache: "no-store" });
     if (!r.ok) { setStatus("API " + r.status); return; }
     const data = await r.json();
-    const cur = data.current;
-    if (!cur) {
-      if (currentId !== null) { try { player.stopVideo(); } catch (e) {} }
-      currentId = null;
-      setInfo(null);
-      setStatus("Queue leer");
+
+    if (data.playlist_id === null) {
+      setStatus("Keine YT-Playlist konfiguriert");
+      document.getElementById("info").textContent =
+        "Keine YouTube-Playlist konfiguriert (YOUTUBE_PLAYLIST_ID).";
       return;
     }
-    setStatus("In Queue: " + data.queue.length);
-    if (cur.id !== currentId) {
-      currentId = cur.id;
-      setInfo(cur.title, cur.requester);
-      updateMediaMetadata(cur.title, cur.requester);
-      if (cur.video_id) player.loadVideoById(cur.video_id);
+
+    const items = (data.items || []).filter((it) => it.video_id);
+    const ids = items.map((it) => it.video_id);
+    titles = {};
+    items.forEach((it) => { titles[it.video_id] = it.title; });
+
+    const sig = ids.join(",");
+    if (sig === lastSig) { setStatus("Songs: " + ids.length); updateInfo(); return; }
+    lastSig = sig;
+
+    if (ids.length === 0) {
+      try { player.stopVideo(); } catch (e) {}
+      setStatus("Playlist leer");
+      updateInfo();
+      return;
     }
+
+    // (Neu) laden – dabei den aktuell laufenden Song moeglichst beibehalten.
+    const curId = currentVideoId();
+    const idx = ids.indexOf(curId);
+    let start = 0, startSec = 0;
+    if (idx >= 0) {
+      start = idx;
+      try { startSec = player.getCurrentTime() || 0; } catch (e) {}
+    }
+    player.loadPlaylist(ids, start, startSec);
+    try { player.setLoop(LOOP); } catch (e) {}
+    setStatus("Songs: " + ids.length);
+    updateInfo();
   } catch (e) { setStatus("Verbindungsfehler"); }
-}
-
-function onState(e) {
-  if (e.data === YT.PlayerState.ENDED) finishCurrent();
-}
-
-async function finishCurrent() {
-  if (currentId == null) return;
-  const id = currentId;
-  currentId = null;          // verhindert Doppel-Ausloesung
-  try { await fetch(api("/api/finished?id=" + id), { method: "POST" }); } catch (e) {}
-  poll();                    // sofort naechsten Song holen
 }
 
 // Falls der Browser Autoplay mit Ton blockiert (normaler Tab): ein Klick startet.

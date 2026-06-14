@@ -141,3 +141,56 @@ class YouTubePlaylist:
                     return resp.status in (200, 204)
         except Exception:
             return False
+
+    async def list(self) -> list:
+        """Liest die komplette Playlist aus (in Reihenfolge).
+
+        Gibt eine Liste von Dicts zurueck:
+            {"item_id": ..., "video_id": ..., "title": ...}
+        Nicht abspielbare/geloeschte Eintraege ohne Video-ID werden uebersprungen.
+        """
+        token = await self._get_access_token()
+        if not token:
+            return []
+        items: list = []
+        page: Optional[str] = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    params = {
+                        "part": "snippet,contentDetails",
+                        "maxResults": "50",
+                        "playlistId": self.playlist_id,
+                    }
+                    if page:
+                        params["pageToken"] = page
+                    async with session.get(
+                        _API_BASE,
+                        params=params,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=_TIMEOUT,
+                    ) as resp:
+                        if resp.status != 200:
+                            txt = await resp.text()
+                            print(f"[YT] List-Fehler {resp.status}: {txt[:200]}")
+                            return items
+                        j = await resp.json()
+                        for it in j.get("items", []):
+                            cd = it.get("contentDetails") or {}
+                            sn = it.get("snippet") or {}
+                            vid = cd.get("videoId") or (sn.get("resourceId") or {}).get("videoId")
+                            if not vid:
+                                continue
+                            items.append(
+                                {
+                                    "item_id": it.get("id"),
+                                    "video_id": vid,
+                                    "title": sn.get("title", ""),
+                                }
+                            )
+                        page = j.get("nextPageToken")
+                        if not page:
+                            break
+        except Exception as e:
+            print(f"[YT] List-Ausnahme: {e}")
+        return items

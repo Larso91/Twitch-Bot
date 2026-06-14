@@ -190,6 +190,7 @@ class Bot(commands.Bot):
         app.router.add_get("/", self._h_root)
         app.router.add_get("/player", self._h_player)
         app.router.add_get("/api/queue", self._h_queue)
+        app.router.add_get("/api/playlist", self._h_playlist)
         app.router.add_post("/api/finished", self._h_finished)
         app.router.add_post("/api/skip", self._h_skip)
         app.router.add_get("/api/skip", self._h_skip)  # bequem fuer Hotkey-Tools
@@ -235,6 +236,17 @@ class Bot(commands.Bot):
         songs = self.db.get_queue()
         out = [self._song_json(s) for s in songs]
         return web.json_response({"current": out[0] if out else None, "queue": out})
+
+    async def _h_playlist(self, request):
+        """Liefert die echte YouTube-Playlist fuer den Direkt-Player."""
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if not self.yt_playlist:
+            return web.json_response({"playlist_id": None, "items": []})
+        items = await self.yt_playlist.list()
+        return web.json_response(
+            {"playlist_id": self.yt_playlist.playlist_id, "items": items}
+        )
 
     async def _h_finished(self, request):
         if not self._check_token(request):
