@@ -83,6 +83,7 @@ function onYouTubeIframeAPIReady() {
         setupMediaSession();
         refresh();
         setInterval(refresh, POLL_MS);
+        setInterval(reportNow, 2000);   // Position/Dauer ans Overlay melden
       },
       onStateChange: onState,
       onError: () => finishCurrent(),   // nicht abspielbar -> entfernen & weiter
@@ -122,6 +123,24 @@ async function finishCurrent() {
       { method: "POST" });
   } catch (e) {}
   loadCurrent();
+}
+
+// Aktuelle Wiedergabe-Position an den Bot melden (fuer das OBS-Overlay).
+async function reportNow() {
+  if (!ready || !currentItemId) return;
+  const it = items[0];
+  if (!it) return;
+  let pos = 0, dur = 0, playing = false;
+  try { pos = player.getCurrentTime() || 0; } catch (e) {}
+  try { dur = player.getDuration() || 0; } catch (e) {}
+  try { playing = player.getPlayerState() === YT.PlayerState.PLAYING; } catch (e) {}
+  try {
+    await fetch(api("/api/nowplaying"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video_id: it.video_id, position: pos, duration: dur, playing }),
+    });
+  } catch (e) {}
 }
 
 async function refresh() {

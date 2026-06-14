@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 
 from aiohttp import web
 from twitchio.ext import commands
@@ -47,6 +48,8 @@ class Bot(commands.Bot):
         # trifft (Quota!). Eintraege: item_id, video_id, title, requester, url.
         self._pl = []
         self._pl_sync_seconds = int(os.environ.get("PLAYLIST_SYNC_SECONDS", "300"))
+        # Wiedergabe-Status vom Player gemeldet (fuer das OBS-Overlay/Restzeit).
+        self._now = None  # {video_id, position, duration, playing, ts}
         # Web-Player (OBS-Browser-Quelle).
         self.player_token = os.environ.get("PLAYER_TOKEN", "").strip()
         self._web_started = False
@@ -295,6 +298,9 @@ class Bot(commands.Bot):
         app = web.Application()
         app.router.add_get("/", self._h_root)
         app.router.add_get("/player", self._h_player)
+        app.router.add_get("/overlay", self._h_overlay)
+        app.router.add_get("/api/nowplaying", self._h_nowplaying)
+        app.router.add_post("/api/nowplaying", self._h_nowplaying_set)
         app.router.add_get("/api/queue", self._h_queue)
         app.router.add_get("/api/playlist", self._h_playlist)
         app.router.add_post("/api/playlist/remove", self._h_playlist_remove)
@@ -337,6 +343,58 @@ class Bot(commands.Bot):
         except FileNotFoundError:
             return web.Response(text="player.html nicht gefunden", status=500)
         return web.Response(text=html, content_type="text/html")
+
+    async def _h_overlay(self, request):
+        """Transparentes 'Now Playing'-Overlay fuer OBS (Browser-Quelle)."""
+        try:
+            with open("overlay.html", encoding="utf-8") as f:
+                html = f.read()
+        except FileNotFoundError:
+            return web.Response(text="overlay.html nicht gefunden", status=500)
+        return web.Response(text=html, content_type="text/html")
+
+    async def _h_nowplaying_set(self, request):
+        """Player meldet aktuelle Position/Dauer (fuer Restzeit im Overlay)."""
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        self._now = {
+            "video_id": data.get("video_id"),
+            "position": float(data.get("position", 0) or 0),
+            "duration": float(data.get("duration", 0) or 0),
+            "playing": bool(data.get("playing", True)),
+            "ts": time.time(),
+        }
+        return web.json_response({"ok": True})
+
+    async def _h_nowplaying(self, request):
+        """Liefert den aktuellen Song + (falls bekannt) verstrichene Zeit/Dauer."""
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        cur = self._pl[0] if (self.yt_playlist and self._pl) else None
+        out = {
+            "title": cur["title"] if cur else None,
+            "requester": cur.get("requester") if cur else None,
+            "video_id": cur["video_id"] if cur else None,
+            "has_time": False,
+        }
+        now = self._now
+        if cur and now and now.get("video_id") == cur["video_id"] and now.get("duration", 0) > 0:
+            elapsed = now["position"]
+            if now.get("playing"):
+                elapsed += time.time() - now["ts"]
+            out.update(
+                {
+                    "has_time": True,
+                    "playing": now.get("playing", True),
+                    "duration": now["duration"],
+                    "elapsed": max(0.0, min(elapsed, now["duration"])),
+                }
+            )
+        return web.json_response(out)
 
     async def _h_queue(self, request):
         if not self._check_token(request):

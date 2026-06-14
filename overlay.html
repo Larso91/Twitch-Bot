@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Now Playing</title>
+<style>
+  /* Transparenter Hintergrund -> in OBS ist nur das Widget sichtbar. */
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden;
+               font-family: "Segoe UI", system-ui, sans-serif; color: #fff; }
+  #wrap { position: fixed; left: 24px; bottom: 24px; opacity: 0;
+          transition: opacity .4s ease; }
+  #wrap.show { opacity: 1; }
+  #card { display: inline-flex; flex-direction: column; gap: 8px;
+          padding: 14px 18px; border-radius: 14px;
+          background: rgba(18, 16, 28, 0); }            /* 0 = voll transparent */
+  .row { display: flex; align-items: center; gap: 10px; }
+  .eq { display: inline-flex; align-items: flex-end; gap: 3px; height: 22px; }
+  .eq i { width: 4px; background: #9146FF; border-radius: 2px;
+          animation: bounce 1s infinite ease-in-out; }
+  .eq i:nth-child(1){ animation-delay: 0s; }
+  .eq i:nth-child(2){ animation-delay: .2s; }
+  .eq i:nth-child(3){ animation-delay: .4s; }
+  .eq i:nth-child(4){ animation-delay: .15s; }
+  .paused .eq i { animation-play-state: paused; height: 8px !important; }
+  @keyframes bounce { 0%,100%{ height: 6px; } 50%{ height: 22px; } }
+  .title { font-size: 30px; font-weight: 700; letter-spacing: .2px;
+           text-shadow: 0 2px 6px rgba(0,0,0,.85), 0 0 2px rgba(0,0,0,.9);
+           max-width: 720px; white-space: nowrap; overflow: hidden;
+           text-overflow: ellipsis; }
+  .req { font-size: 18px; opacity: .9; text-shadow: 0 2px 5px rgba(0,0,0,.85); }
+  .req b { color: #b78cff; }
+  .barwrap { display: flex; align-items: center; gap: 10px; }
+  .bar { width: 360px; height: 7px; border-radius: 4px;
+         background: rgba(255,255,255,.22);
+         box-shadow: 0 1px 3px rgba(0,0,0,.6) inset; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0;
+             background: linear-gradient(90deg, #9146FF, #c9a6ff); }
+  .time { font-variant-numeric: tabular-nums; font-size: 16px;
+          text-shadow: 0 2px 5px rgba(0,0,0,.85); min-width: 92px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="card">
+    <div class="row">
+      <span class="eq"><i></i><i></i><i></i><i></i></span>
+      <span class="title" id="title"></span>
+    </div>
+    <div class="req" id="req"></div>
+    <div class="barwrap" id="barwrap">
+      <div class="bar"><i id="fill"></i></div>
+      <div class="time" id="time"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const POLL_MS = 2500;
+
+const wrap = document.getElementById("wrap");
+const card = document.getElementById("card");
+const elTitle = document.getElementById("title");
+const elReq = document.getElementById("req");
+const elBarwrap = document.getElementById("barwrap");
+const elFill = document.getElementById("fill");
+const elTime = document.getElementById("time");
+
+// Lokale Basis fuer fluessiges Hochzaehlen zwischen den Polls.
+let base = null; // { elapsed, duration, playing, at }
+
+function api(path) {
+  const sep = path.includes("?") ? "&" : "?";
+  return path + sep + "token=" + encodeURIComponent(TOKEN);
+}
+function fmt(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + ":" + String(s).padStart(2, "0");
+}
+
+async function poll() {
+  try {
+    const r = await fetch(api("/api/nowplaying"), { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+
+    if (!d.title) {            // kein Song -> Overlay ausblenden
+      wrap.classList.remove("show");
+      base = null;
+      return;
+    }
+    elTitle.textContent = d.title;
+    if (d.requester) { elReq.style.display = ""; elReq.innerHTML = "Request von <b>@" + d.requester + "</b>"; }
+    else { elReq.style.display = "none"; }
+
+    if (d.has_time) {
+      elBarwrap.style.display = "";
+      base = { elapsed: d.elapsed, duration: d.duration, playing: d.playing, at: performance.now() };
+    } else {                   // z.B. Player nicht offen / Live -> nur Titel
+      elBarwrap.style.display = "none";
+      base = null;
+    }
+    wrap.classList.add("show");
+  } catch (e) {}
+}
+
+function tick() {
+  if (!base) return;
+  const el = base.playing ? base.elapsed + (performance.now() - base.at) / 1000 : base.elapsed;
+  const elapsed = Math.min(el, base.duration);
+  const remaining = base.duration - elapsed;
+  elFill.style.width = (base.duration > 0 ? (elapsed / base.duration) * 100 : 0) + "%";
+  elTime.textContent = "-" + fmt(remaining) + "  /  " + fmt(base.duration);
+  card.classList.toggle("paused", !base.playing);
+}
+
+poll();
+setInterval(poll, POLL_MS);
+setInterval(tick, 200);
+</script>
+</body>
+</html>
