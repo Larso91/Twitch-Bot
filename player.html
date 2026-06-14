@@ -26,11 +26,11 @@
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
-const POLL_MS = 5000;        // wie oft die Playlist auf Aenderungen geprueft wird
-const LOOP = true;           // Playlist endlos wiederholen (keine Totzeit)
+const POLL_MS = 3000;        // Playlist auf Aenderungen pruefen (snappy Skip)
 let player, ready = false;
-let lastSig = "";            // Signatur der zuletzt geladenen Video-ID-Liste
-let titles = {};             // video_id -> Titel (aus der YouTube-Playlist)
+let items = [];              // [{item_id, video_id, title, requester}] in Reihenfolge
+let currentItemId = null;
+const recentlyRemoved = new Set();   // verhindert Wiederauftauchen wegen API-Latenz
 
 function api(path) {
   const sep = path.includes("?") ? "&" : "?";
@@ -38,67 +38,39 @@ function api(path) {
 }
 function setStatus(t) { document.getElementById("status").textContent = t; }
 
-function currentVideoId() {
-  try { const d = player.getVideoData(); return d && d.video_id; }
-  catch (e) { return null; }
-}
-
-function updateInfo() {
-  const vid = currentVideoId();
-  let title = (vid && titles[vid]) || "";
-  if (!title) { try { const d = player.getVideoData(); title = (d && d.title) || ""; } catch (e) {} }
-  let pos = "";
-  try {
-    const list = player.getPlaylist() || [];
-    const i = player.getPlaylistIndex();
-    if (list.length && i >= 0) pos = (i + 1) + " / " + list.length;
-  } catch (e) {}
-  document.getElementById("info").innerHTML = title
-    ? title + (pos ? ' <span class="req">' + pos + "</span>" : "")
+function setInfo() {
+  const it = items[0];
+  document.getElementById("info").innerHTML = it
+    ? it.title + (it.requester ? ' <span class="req">— @' + it.requester + "</span>" : "")
     : "Warte auf Songs &hellip;";
 }
 
 function updateMediaMetadata() {
   if (!("mediaSession" in navigator) || !window.MediaMetadata) return;
-  const vid = currentVideoId();
-  let title = (vid && titles[vid]) || "";
-  if (!title) { try { const d = player.getVideoData(); title = (d && d.title) || ""; } catch (e) {} }
+  const it = items[0];
   try {
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: title || "Song Request Player",
+      title: it ? it.title : "Song Request Player",
+      artist: it && it.requester ? "@" + it.requester : "",
       album: "Songrequests",
     });
   } catch (e) {}
 }
 
-// ---- Steuerung ----
-function togglePlay() {
-  if (!player || !player.getPlayerState) return;
-  player.getPlayerState() === YT.PlayerState.PLAYING
-    ? player.pauseVideo() : player.playVideo();
-}
-function restartSong() { try { player.seekTo(0, true); player.playVideo(); } catch (e) {} }
-function nextSong() { try { player.nextVideo(); } catch (e) {} }
-function prevSong() { try { player.previousVideo(); } catch (e) {} }
-
-document.addEventListener("keydown", (e) => {
-  switch (e.code) {
-    case "Space": case "KeyK": e.preventDefault(); togglePlay(); break;
-    case "ArrowRight": case "KeyN": nextSong(); break;
-    case "ArrowLeft": prevSong(); break;
-  }
-});
-
+// ---- Steuerung: NUR Medientasten ----
+// Play/Pause uebernimmt YouTube global selbst (eigene Media-Session des iframes).
+// Next-Track wird zusaetzlich global per AutoHotkey -> /api/skip abgefangen.
 function setupMediaSession() {
   if (!("mediaSession" in navigator)) return;
   try {
     navigator.mediaSession.setActionHandler("play", () => player.playVideo());
     navigator.mediaSession.setActionHandler("pause", () => player.pauseVideo());
     navigator.mediaSession.setActionHandler("stop", () => player.pauseVideo());
-    navigator.mediaSession.setActionHandler("nexttrack", () => nextSong());
-    navigator.mediaSession.setActionHandler("previoustrack", () => prevSong());
+    navigator.mediaSession.setActionHandler("nexttrack", () => finishCurrent());
+    navigator.mediaSession.setActionHandler("previoustrack", () => restartSong());
   } catch (e) {}
 }
+function restartSong() { try { player.seekTo(0, true); player.playVideo(); } catch (e) {} }
 
 // ---- YouTube IFrame API ----
 function onYouTubeIframeAPIReady() {
@@ -108,23 +80,48 @@ function onYouTubeIframeAPIReady() {
     events: {
       onReady: () => {
         ready = true;
-        try { player.setLoop(LOOP); } catch (e) {}
         setupMediaSession();
         refresh();
         setInterval(refresh, POLL_MS);
-        setInterval(() => { updateInfo(); updateMediaMetadata(); }, 1000);
       },
       onStateChange: onState,
-      onError: () => nextSong(),   // nicht abspielbar (privat/gesperrt) -> ueberspringen
+      onError: () => finishCurrent(),   // nicht abspielbar -> entfernen & weiter
     },
   });
 }
 
 function onState(e) {
-  if (e.data === YT.PlayerState.ENDED) {
-    // Playlist-Ende -> neu laden, damit neue Requests auftauchen.
-    if (!LOOP) refresh();
+  if (e.data === YT.PlayerState.ENDED) finishCurrent();
+}
+
+function loadCurrent() {
+  if (!items.length) {
+    if (currentItemId !== null) { try { player.stopVideo(); } catch (e) {} }
+    currentItemId = null;
+    setInfo();
+    return;
   }
+  const it = items[0];
+  if (it.item_id === currentItemId) return;   // laeuft bereits -> nicht unterbrechen
+  currentItemId = it.item_id;
+  player.loadVideoById(it.video_id);
+  setInfo();
+  updateMediaMetadata();
+}
+
+// Aktuellen Song als fertig markieren: aus der YouTube-Playlist entfernen & weiter.
+async function finishCurrent() {
+  if (!currentItemId) return;
+  const removeId = currentItemId;
+  recentlyRemoved.add(removeId);
+  setTimeout(() => recentlyRemoved.delete(removeId), 30000);
+  items = items.filter((it) => it.item_id !== removeId);
+  currentItemId = null;
+  try {
+    await fetch(api("/api/playlist/remove?item_id=" + encodeURIComponent(removeId)),
+      { method: "POST" });
+  } catch (e) {}
+  loadCurrent();
 }
 
 async function refresh() {
@@ -141,34 +138,12 @@ async function refresh() {
       return;
     }
 
-    const items = (data.items || []).filter((it) => it.video_id);
-    const ids = items.map((it) => it.video_id);
-    titles = {};
-    items.forEach((it) => { titles[it.video_id] = it.title; });
-
-    const sig = ids.join(",");
-    if (sig === lastSig) { setStatus("Songs: " + ids.length); updateInfo(); return; }
-    lastSig = sig;
-
-    if (ids.length === 0) {
-      try { player.stopVideo(); } catch (e) {}
-      setStatus("Playlist leer");
-      updateInfo();
-      return;
-    }
-
-    // (Neu) laden – dabei den aktuell laufenden Song moeglichst beibehalten.
-    const curId = currentVideoId();
-    const idx = ids.indexOf(curId);
-    let start = 0, startSec = 0;
-    if (idx >= 0) {
-      start = idx;
-      try { startSec = player.getCurrentTime() || 0; } catch (e) {}
-    }
-    player.loadPlaylist(ids, start, startSec);
-    try { player.setLoop(LOOP); } catch (e) {}
-    setStatus("Songs: " + ids.length);
-    updateInfo();
+    items = (data.items || [])
+      .filter((it) => it.video_id && !recentlyRemoved.has(it.item_id));
+    setStatus(items.length ? "In Queue: " + items.length : "Playlist leer");
+    loadCurrent();
+    setInfo();
+    updateMediaMetadata();
   } catch (e) { setStatus("Verbindungsfehler"); }
 }
 

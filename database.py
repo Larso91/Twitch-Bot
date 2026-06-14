@@ -135,6 +135,18 @@ class Database:
             c = conn.execute("DELETE FROM queue WHERE id = ?", (song_id,))
             return c.rowcount > 0
 
+    def get_by_yt_item_id(self, item_id: str) -> Optional[Dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM queue WHERE yt_item_id = ? LIMIT 1", (item_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def remove_by_yt_item_id(self, item_id: str) -> bool:
+        with self._conn() as conn:
+            c = conn.execute("DELETE FROM queue WHERE yt_item_id = ?", (item_id,))
+            return c.rowcount > 0
+
     def get_last_by_requester(self, requester: str) -> Optional[Dict]:
         with self._conn() as conn:
             row = conn.execute(

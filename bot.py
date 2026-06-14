@@ -41,6 +41,12 @@ class Bot(commands.Bot):
         self._room_id = None
         # YouTube-Playlist-Sync (nur aktiv, wenn OAuth-Daten gesetzt sind).
         self.yt_playlist = YouTubePlaylist.from_env()
+        # In-Memory-Abbild der YouTube-Playlist (Wiedergabe-Quelle des Players).
+        # Wird beim Start aus YouTube geladen und bei jedem add/remove lokal
+        # nachgefuehrt, damit der Player-Poll NICHT staendig die YouTube-API
+        # trifft (Quota!). Eintraege: item_id, video_id, title, requester, url.
+        self._pl = []
+        self._pl_sync_seconds = int(os.environ.get("PLAYLIST_SYNC_SECONDS", "300"))
         # Web-Player (OBS-Browser-Quelle).
         self.player_token = os.environ.get("PLAYER_TOKEN", "").strip()
         self._web_started = False
@@ -63,6 +69,8 @@ class Bot(commands.Bot):
         if not self._web_started:
             self._web_started = True
             asyncio.create_task(self._start_web())
+            if self.yt_playlist:
+                asyncio.create_task(self._playlist_sync_loop())
 
     async def event_message(self, message):
         if message.echo:
@@ -163,6 +171,8 @@ class Bot(commands.Bot):
             item_id = await self.yt_playlist.add(video_id)
             if item_id:
                 self.db.set_yt_item_id(song_id, item_id)
+                # Sofort ins In-Memory-Abbild, damit der Player es direkt sieht.
+                self._pl_add(item_id, video_id, info["title"], ctx.author.name, url)
             else:
                 yt_note = " (Hinweis: konnte nicht zur YouTube-Playlist hinzugefügt werden)"
 
@@ -181,6 +191,102 @@ class Bot(commands.Bot):
                 print(f"YT-Playlist remove fehlgeschlagen: {e}")
 
     # ------------------------------------------------------------------ #
+    # Playlist als Wiedergabe-Quelle (In-Memory-Abbild der YT-Playlist)
+    # ------------------------------------------------------------------ #
+
+    async def _playlist_sync_loop(self):
+        """Gleicht das In-Memory-Abbild regelmaessig mit YouTube ab.
+
+        Faengt externe Aenderungen ab (z.B. manuell in YouTube editiert) und
+        stellt nach einem Neustart die Liste wieder her. Laeuft selten, um die
+        YouTube-API-Quota zu schonen.
+        """
+        while True:
+            try:
+                await self._reload_playlist_from_yt()
+            except Exception as e:
+                print(f"Playlist-Sync Fehler: {e}")
+            await asyncio.sleep(self._pl_sync_seconds)
+
+    async def _reload_playlist_from_yt(self):
+        """Laedt die echte YouTube-Playlist und reichert sie mit Requester-
+        Namen aus der SQLite-Queue an (per yt_item_id)."""
+        items = await self.yt_playlist.list()
+        merged = []
+        for it in items:
+            row = self.db.get_by_yt_item_id(it["item_id"])
+            merged.append(
+                {
+                    "item_id": it["item_id"],
+                    "video_id": it["video_id"],
+                    "title": it["title"],
+                    "requester": row["requester"] if row else None,
+                    "url": row["url"] if row else f"https://youtu.be/{it['video_id']}",
+                }
+            )
+        self._pl = merged
+        print(f"Playlist synchronisiert: {len(merged)} Song(s)")
+
+    def _pl_add(self, item_id, video_id, title, requester, url):
+        """Neuen Song lokal ans Ende der Playlist anhaengen (YOUTUBE_INSERT_POSITION=end)."""
+        self._pl.append(
+            {
+                "item_id": item_id,
+                "video_id": video_id,
+                "title": title,
+                "requester": requester,
+                "url": url,
+            }
+        )
+
+    async def _remove_playlist_item(self, item_id):
+        """Entfernt einen Eintrag aus YouTube-Playlist, In-Memory-Abbild und SQLite."""
+        if self.yt_playlist:
+            try:
+                await self.yt_playlist.remove(item_id)
+            except Exception as e:
+                print(f"YT-Playlist remove fehlgeschlagen: {e}")
+        self._pl = [x for x in self._pl if x["item_id"] != item_id]
+        self.db.remove_by_yt_item_id(item_id)
+
+    def _queue_view(self):
+        """Einheitliche Sicht auf die aktuelle Queue (Reihenfolge = Wiedergabe).
+
+        Mit aktiver YT-Playlist: das In-Memory-Abbild. Sonst: die SQLite-Queue
+        (Fallback fuer lokale Tests ohne OAuth).
+        """
+        if self.yt_playlist:
+            return [
+                {
+                    "title": x["title"],
+                    "requester": x.get("requester"),
+                    "url": x.get("url") or f"https://youtu.be/{x['video_id']}",
+                    "video_id": x["video_id"],
+                    "item_id": x["item_id"],
+                    "sqlite_id": None,
+                }
+                for x in self._pl
+            ]
+        return [
+            {
+                "title": s["title"],
+                "requester": s["requester"],
+                "url": s["url"],
+                "video_id": extract_video_id(s["url"]),
+                "item_id": None,
+                "sqlite_id": s["id"],
+            }
+            for s in self.db.get_queue()
+        ]
+
+    async def _queue_remove(self, entry):
+        """Entfernt einen Queue-Eintrag (egal ob YT-Playlist oder SQLite-Fallback)."""
+        if entry.get("item_id"):
+            await self._remove_playlist_item(entry["item_id"])
+        elif entry.get("sqlite_id"):
+            self.db.remove_by_id(entry["sqlite_id"])
+
+    # ------------------------------------------------------------------ #
     # Web-Player (OBS-Browser-Quelle)
     # ------------------------------------------------------------------ #
 
@@ -191,6 +297,8 @@ class Bot(commands.Bot):
         app.router.add_get("/player", self._h_player)
         app.router.add_get("/api/queue", self._h_queue)
         app.router.add_get("/api/playlist", self._h_playlist)
+        app.router.add_post("/api/playlist/remove", self._h_playlist_remove)
+        app.router.add_get("/api/playlist/remove", self._h_playlist_remove)
         app.router.add_post("/api/finished", self._h_finished)
         app.router.add_post("/api/skip", self._h_skip)
         app.router.add_get("/api/skip", self._h_skip)  # bequem fuer Hotkey-Tools
@@ -238,15 +346,38 @@ class Bot(commands.Bot):
         return web.json_response({"current": out[0] if out else None, "queue": out})
 
     async def _h_playlist(self, request):
-        """Liefert die echte YouTube-Playlist fuer den Direkt-Player."""
+        """Liefert die Playlist (In-Memory-Abbild) fuer den Direkt-Player.
+
+        Serviert aus dem Arbeitsspeicher, damit der 3s-Poll des Players NICHT
+        bei jedem Aufruf die YouTube-API belastet.
+        """
         if not self._check_token(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         if not self.yt_playlist:
             return web.json_response({"playlist_id": None, "items": []})
-        items = await self.yt_playlist.list()
+        items = [
+            {
+                "item_id": x["item_id"],
+                "video_id": x["video_id"],
+                "title": x["title"],
+                "requester": x.get("requester"),
+            }
+            for x in self._pl
+            if x.get("video_id")
+        ]
         return web.json_response(
             {"playlist_id": self.yt_playlist.playlist_id, "items": items}
         )
+
+    async def _h_playlist_remove(self, request):
+        """Player meldet: aktueller Song fertig/uebersprungen -> aus Playlist entfernen."""
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        item_id = request.query.get("item_id", "").strip()
+        if not item_id:
+            return web.json_response({"ok": False, "reason": "no-id"})
+        await self._remove_playlist_item(item_id)
+        return web.json_response({"ok": True, "removed": item_id})
 
     async def _h_finished(self, request):
         if not self._check_token(request):
@@ -263,13 +394,15 @@ class Bot(commands.Bot):
         return web.json_response({"ok": False, "reason": "not-current"})
 
     async def _h_skip(self, request):
+        """Globaler Skip (Media_Next via AHK): ersten Song der Playlist entfernen."""
         if not self._check_token(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        song = self.db.remove_first()
-        if song:
-            await self._remove_from_yt(song)
-            return web.json_response({"ok": True, "skipped": song["id"], "title": song["title"]})
-        return web.json_response({"ok": False, "reason": "empty"})
+        view = self._queue_view()
+        if not view:
+            return web.json_response({"ok": False, "reason": "empty"})
+        entry = view[0]
+        await self._queue_remove(entry)
+        return web.json_response({"ok": True, "title": entry["title"]})
 
     def _write_streamlist_file(self):
         """Schreibt die komplette Streamliste in eine wachsende Textdatei."""
@@ -288,23 +421,28 @@ class Bot(commands.Bot):
 
     @commands.command(name="wrongsong", aliases=["ws"])
     async def wrongsong(self, ctx: commands.Context):
-        song = self.db.get_last_by_requester(ctx.author.name)
-        if not song:
+        name = ctx.author.name.lower()
+        view = self._queue_view()
+        # Letzten eigenen Song finden (von hinten).
+        entry = next(
+            (e for e in reversed(view) if (e["requester"] or "").lower() == name), None
+        )
+        if not entry:
             await ctx.send(f"@{ctx.author.name} Du hast keinen Song in der Queue.")
             return
-        self.db.remove_by_id(song["id"])
-        await self._remove_from_yt(song)
-        await ctx.send(f"@{ctx.author.name} Song entfernt: {song['title']}")
+        await self._queue_remove(entry)
+        await ctx.send(f"@{ctx.author.name} Song entfernt: {entry['title']}")
 
     @commands.command(name="queue", aliases=["q"])
     async def queue(self, ctx: commands.Context):
-        songs = self.db.get_queue()
-        if not songs:
+        view = self._queue_view()
+        if not view:
             await ctx.send("Die Queue ist leer. Füge mit !sr <YouTube-Link> Songs hinzu!")
             return
-        total = len(songs)
+        total = len(view)
         entries = " | ".join(
-            f"#{i + 1} {s['title']} (@{s['requester']})" for i, s in enumerate(songs[:5])
+            f"#{i + 1} {e['title']} (@{e['requester'] or '?'})"
+            for i, e in enumerate(view[:5])
         )
         suffix = f" ... und {total - 5} weitere" if total > 5 else ""
         await ctx.send(f"Queue ({total} Songs): {entries}{suffix}")
@@ -322,12 +460,13 @@ class Bot(commands.Bot):
 
     @commands.command(name="currentsong", aliases=["np", "song"])
     async def current_song(self, ctx: commands.Context):
-        song = self.db.get_first()
-        if not song:
+        view = self._queue_view()
+        if not view:
             await ctx.send("Aktuell kein Song in der Queue.")
             return
+        cur = view[0]
         await ctx.send(
-            f"Aktueller Song: {song['title']} (von @{song['requester']}) -> {song['url']}"
+            f"Aktueller Song: {cur['title']} (von @{cur['requester'] or 'unbekannt'}) -> {cur['url']}"
         )
 
     @commands.command(name="skip")
@@ -335,12 +474,13 @@ class Bot(commands.Bot):
         if not (ctx.author.is_mod or ctx.author.is_broadcaster):
             await ctx.send(f"@{ctx.author.name} Nur Mods können Songs überspringen.")
             return
-        song = self.db.remove_first()
-        if song:
-            await self._remove_from_yt(song)
-            await ctx.send(f"Übersprungen: {song['title']}")
-        else:
+        view = self._queue_view()
+        if not view:
             await ctx.send("Die Queue ist leer.")
+            return
+        entry = view[0]
+        await self._queue_remove(entry)
+        await ctx.send(f"Übersprungen: {entry['title']}")
 
     @commands.command(name="remove", aliases=["sr_remove"])
     async def remove(self, ctx: commands.Context, *, position: str = None):
@@ -348,30 +488,31 @@ class Bot(commands.Bot):
             await ctx.send(f"@{ctx.author.name} Benutze: !remove <Position>")
             return
         pos = int(position.strip())
-        songs = self.db.get_queue()
-        if pos < 1 or pos > len(songs):
+        view = self._queue_view()
+        if pos < 1 or pos > len(view):
             await ctx.send(
-                f"@{ctx.author.name} Position {pos} existiert nicht (Queue: {len(songs)} Songs)."
+                f"@{ctx.author.name} Position {pos} existiert nicht (Queue: {len(view)} Songs)."
             )
             return
-        song = songs[pos - 1]
+        entry = view[pos - 1]
         is_mod = ctx.author.is_mod or ctx.author.is_broadcaster
-        is_own = song["requester"].lower() == ctx.author.name.lower()
+        is_own = (entry["requester"] or "").lower() == ctx.author.name.lower()
         if not is_mod and not is_own:
             await ctx.send(f"@{ctx.author.name} Du kannst nur deine eigenen Songs entfernen.")
             return
-        self.db.remove_by_id(song["id"])
-        await self._remove_from_yt(song)
-        await ctx.send(f"@{ctx.author.name} Entfernt: {song['title']}")
+        await self._queue_remove(entry)
+        await ctx.send(f"@{ctx.author.name} Entfernt: {entry['title']}")
 
     @commands.command(name="clearqueue", aliases=["clearsr"])
     async def clearqueue(self, ctx: commands.Context):
         if not (ctx.author.is_mod or ctx.author.is_broadcaster):
             return
-        songs = self.db.get_queue()
-        count = self.db.clear_queue()
-        for song in songs:
-            await self._remove_from_yt(song)
+        view = self._queue_view()
+        count = len(view)
+        for entry in view:
+            await self._queue_remove(entry)
+        # SQLite-Queue zusaetzlich leeren (Requester-Sidecar).
+        self.db.clear_queue()
         await ctx.send(f"Queue geleert. {count} Song(s) entfernt.")
 
     # ------------------------------------------------------------------ #
