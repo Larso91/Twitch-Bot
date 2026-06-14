@@ -2,6 +2,16 @@ import asyncio
 import os
 import time
 
+# Lokale Entwicklung: Variablen aus einer .env-Datei laden, falls vorhanden.
+# Auf Railway o.ae. werden die Env-Vars von der Plattform gesetzt; dort ist
+# weder eine .env-Datei noch python-dotenv noetig (Import per try/except).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 from aiohttp import web
 from twitchio.ext import commands
 
