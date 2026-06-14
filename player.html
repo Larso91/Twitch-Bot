@@ -125,11 +125,19 @@ async function reportNow() {
   try { pos = player.getCurrentTime() || 0; } catch (e) {}
   try { dur = player.getDuration() || 0; } catch (e) {}
   try { playing = player.getPlayerState() === YT.PlayerState.PLAYING; } catch (e) {}
+  // Titel + Requester des wirklich laufenden Songs mitschicken, damit das
+  // OBS-Overlay zuverlaessig den richtigen Song anzeigt.
+  const it = items[indexOfCurrent()] || {};
   try {
     await fetch(api("/api/nowplaying"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ video_id: currentVid, position: pos, duration: dur, playing }),
+      body: JSON.stringify({
+        video_id: currentVid,
+        title: it.title || "",
+        requester: it.requester || "",
+        position: pos, duration: dur, playing,
+      }),
     });
   } catch (e) {}
 }

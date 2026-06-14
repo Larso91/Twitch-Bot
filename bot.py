@@ -171,9 +171,10 @@ class Bot(commands.Bot):
         song_id, position = self.db.add_song(url, info["title"], ctx.author.name)
         self._write_streamlist_file()
 
-        # In die echte YouTube-Playlist eintragen (falls aktiviert) – direkt
-        # HINTER dem aktuell laufenden Song, damit der Request als Naechstes laeuft.
+        # In die echte YouTube-Playlist eintragen (falls aktiviert) – hinter dem
+        # laufenden Song und hinter schon wartenden Requests (FIFO).
         yt_note = ""
+        when = "in die Warteschlange aufgenommen"
         if self.yt_playlist and video_id:
             pos = self._insert_position()
             item_id = await self.yt_playlist.add(video_id, position=pos)
@@ -181,11 +182,14 @@ class Bot(commands.Bot):
                 self.db.set_yt_item_id(song_id, item_id)
                 # Sofort ins In-Memory-Abbild, damit der Player es direkt sieht.
                 self._pl_insert(pos, item_id, video_id, info["title"], ctx.author.name, url)
+                ci = self._current_index()
+                ahead = pos - (ci + 1) if ci >= 0 else pos - 1
+                when = "spielt als Nächstes" if ahead <= 0 else f"an Position {ahead + 1} der Warteschlange"
             else:
                 yt_note = " (Hinweis: konnte nicht zur YouTube-Playlist hinzugefügt werden)"
 
         await ctx.send(
-            f"@{ctx.author.name} Hinzugefügt — spielt als Nächstes: {info['title']}{yt_note}"
+            f"@{ctx.author.name} {info['title']} — {when}{yt_note}"
         )
 
     async def _remove_from_yt(self, song):
@@ -258,13 +262,21 @@ class Bot(commands.Bot):
         return -1
 
     def _insert_position(self):
-        """Position fuer einen neuen Request: direkt hinter dem laufenden Song."""
+        """Position fuer einen neuen Request.
+
+        Hinter dem laufenden Song UND hinter bereits wartenden Requests, damit
+        mehrere Requests in der Reihenfolge ihres Eingangs (FIFO) nacheinander
+        laufen – statt sich gegenseitig zu ueberholen (das fuehrte zu
+        Rueckwaerts-Reihenfolge).
+        """
         if not self._pl:
             return 0
         ci = self._current_index()
-        if ci >= 0:
-            return ci + 1
-        return 1  # laeuft gerade nichts Bekanntes -> hinter den ersten Song
+        pos = ci + 1 if ci >= 0 else 1  # laeuft nichts Bekanntes -> hinter den ersten Song
+        # Ueber bereits wartende Requests (haben einen Requester) hinwegspringen.
+        while pos < len(self._pl) and self._pl[pos].get("requester"):
+            pos += 1
+        return pos
 
     async def _remove_playlist_item(self, item_id):
         """Entfernt einen Eintrag aus YouTube-Playlist, In-Memory-Abbild und SQLite."""
@@ -387,6 +399,8 @@ class Bot(commands.Bot):
             data = {}
         self._now = {
             "video_id": data.get("video_id"),
+            "title": (data.get("title") or "").strip() or None,
+            "requester": (data.get("requester") or "").strip() or None,
             "position": float(data.get("position", 0) or 0),
             "duration": float(data.get("duration", 0) or 0),
             "playing": bool(data.get("playing", True)),
@@ -395,20 +409,43 @@ class Bot(commands.Bot):
         return web.json_response({"ok": True})
 
     async def _h_nowplaying(self, request):
-        """Liefert den aktuellen Song + (falls bekannt) verstrichene Zeit/Dauer."""
+        """Liefert den aktuellen Song + (falls bekannt) verstrichene Zeit/Dauer.
+
+        Quelle ist primaer die Meldung des Players (self._now) – das ist exakt
+        der Song, der WIRKLICH laeuft. So zeigt das OBS-Overlay zuverlaessig den
+        richtigen Titel, auch wenn sich die Playlist-Reihenfolge gerade aendert
+        (frueher fiel es faelschlich auf _pl[0] zurueck = falscher Song).
+        """
         if not self._check_token(request):
             return web.json_response({"error": "unauthorized"}, status=401)
+        now = self._now
         cur = None
-        if self.yt_playlist and self._pl:
+        if now and now.get("video_id"):
+            cur = {
+                "video_id": now["video_id"],
+                "title": now.get("title"),
+                "requester": now.get("requester"),
+            }
+            # Falls der Player (noch) keine Metadaten mitschickt: im
+            # In-Memory-Abbild der Playlist nachschlagen.
+            if not cur["title"] and self._pl:
+                match = next((x for x in self._pl if x["video_id"] == now["video_id"]), None)
+                if match:
+                    cur["title"] = match["title"]
+                    if not cur["requester"]:
+                        cur["requester"] = match.get("requester")
+        elif self.yt_playlist and self._pl:
+            # Noch keine Player-Meldung -> bestmoegliche Schaetzung.
             ci = self._current_index()
-            cur = self._pl[ci] if ci >= 0 else self._pl[0]
+            e = self._pl[ci] if ci >= 0 else self._pl[0]
+            cur = {"video_id": e["video_id"], "title": e["title"], "requester": e.get("requester")}
+
         out = {
             "title": cur["title"] if cur else None,
             "requester": cur.get("requester") if cur else None,
             "video_id": cur["video_id"] if cur else None,
             "has_time": False,
         }
-        now = self._now
         if cur and now and now.get("video_id") == cur["video_id"] and now.get("duration", 0) > 0:
             elapsed = now["position"]
             if now.get("playing"):

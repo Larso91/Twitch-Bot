@@ -58,9 +58,9 @@ class Database:
     def add_song(self, url: str, title: str, requester: str):
         """Song hinzufügen. Gibt (song_id, position) zurück.
 
-        Der neue Song wird direkt hinter dem aktuell laufenden (ersten) Song
-        eingereiht, spielt also als Nächstes. Zusätzlich wird er dauerhaft in
-        der Streamliste protokolliert.
+        Der neue Song wird ans Ende der Warteschlange gehängt, sodass mehrere
+        Requests in der Reihenfolge ihres Eingangs (FIFO) nacheinander spielen.
+        Zusätzlich wird er dauerhaft in der Streamliste protokolliert.
         """
         with self._conn() as conn:
             keys = [
@@ -69,13 +69,9 @@ class Database:
                     "SELECT sort_key FROM queue ORDER BY sort_key ASC, id ASC"
                 )
             ]
-            if not keys:
-                new_key = 0.0
-            elif len(keys) == 1:
-                new_key = keys[0] + 1.0
-            else:
-                # Zwischen aktuellem Song (keys[0]) und dem danach einsortieren.
-                new_key = (keys[0] + keys[1]) / 2.0
+            # FIFO: ans Ende der Warteschlange (frueher wurde zwischen Key 0 und 1
+            # eingefuegt, was mehrere Requests rueckwaerts sortierte).
+            new_key = (max(keys) + 1.0) if keys else 0.0
 
             cur = conn.execute(
                 "INSERT INTO queue (url, title, requester, sort_key) VALUES (?, ?, ?, ?)",
