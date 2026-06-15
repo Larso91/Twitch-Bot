@@ -230,18 +230,40 @@ class Bot(commands.Bot):
 
     async def _reload_playlist_from_yt(self):
         """Laedt die echte YouTube-Playlist und reichert sie mit Requester-
-        Namen aus der SQLite-Queue an (per yt_item_id)."""
+        Namen aus der SQLite-Queue an (per yt_item_id).
+
+        Wichtig: YouTube liefert fuer frisch eingefuegte playlistItems oft
+        einen LEEREN snippet.title (Backend-Propagation kann Minuten dauern).
+        Wuerde dieser leere Titel uebernommen, verschwaende der Songtitel im
+        OBS-Overlay/Player, waehrend der Requester (aus SQLite) bestehen bleibt
+        -> "Request von @user" ohne Titel. Daher wird ein leerer API-Titel NICHT
+        uebernommen, sondern aus bekannten Quellen rekonstruiert: zuerst die
+        SQLite-Queue, dann das bisherige In-Memory-Abbild, zuletzt YouTube
+        oEmbed (kein API-Key noetig).
+        """
         items = await self.yt_playlist.list()
+        # Bereits bekannte Titel aus dem aktuellen Abbild (per item_id).
+        prev_titles = {x["item_id"]: x["title"] for x in self._pl if x.get("title")}
         merged = []
         for it in items:
             row = self.db.get_by_yt_item_id(it["item_id"])
+            url = row["url"] if row else f"https://youtu.be/{it['video_id']}"
+            title = (it.get("title") or "").strip()
+            if not title and row and (row["title"] or "").strip():
+                title = row["title"].strip()
+            if not title:
+                title = prev_titles.get(it["item_id"], "")
+            if not title:  # letzter Ausweg: oEmbed-Lookup
+                info = await get_video_info(url)
+                if info:
+                    title = info["title"]
             merged.append(
                 {
                     "item_id": it["item_id"],
                     "video_id": it["video_id"],
-                    "title": it["title"],
+                    "title": title,
                     "requester": row["requester"] if row else None,
-                    "url": row["url"] if row else f"https://youtu.be/{it['video_id']}",
+                    "url": url,
                 }
             )
         self._pl = merged
