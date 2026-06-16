@@ -888,13 +888,18 @@ class Bot(commands.Bot):
         self.chat.set_word_emotes(names)
         await ctx.send(f"Emote-Listen neu geladen: {len(names)} BTTV/7TV-Emotes.")
 
-    @commands.command(name="commands", aliases=["hilfe", "help"])
+    @commands.command(name="commands", aliases=["hilfe", "help", "befehle"])
     async def help_cmd(self, ctx: commands.Context):
         await ctx.send(
-            "Befehle: !sr <Link> | !wrongsong | !queue | !np | !streamlist | "
-            "!remove <#> | !clip <Link> | !wrongclip | !clipqueue | "
-            "[Mod] !skip | !clearqueue | !skipclip | !clearclips | "
-            "!sron | !sroff | !clipon | !clipoff | !reactions on/off | !reloademotes"
+            "Für alle: !sr <Link> (Song) | !clip <Link> (Clip) | !queue | "
+            "!clipqueue | !np (aktueller Song) | !streamlist | !wrongsong "
+            "(eigener Song) | !wrongclip (eigener Clip) | !remove <#> (eigener "
+            "Song) | !commands"
+        )
+        await ctx.send(
+            "Nur Mods/Broadcaster: !skip | !clearqueue | !skipclip | !clearclips "
+            "| !sron/!sroff (Songrequests an/aus) | !clipon/!clipoff (Clips an/aus) "
+            "| !reactions on/off | !reloademotes"
         )
 
 
