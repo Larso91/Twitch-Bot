@@ -16,9 +16,11 @@ from aiohttp import web
 from twitchio.ext import commands
 
 from chat import ChatExtras
+from clips import canonical_clip_url, extract_clip_slug, is_valid_clip_url
 from database import Database
 from emotes import fetch_channel_emote_names, twitch_emote_names
 from jokes import get_random_joke
+from twitch_api import TwitchAPI
 from youtube_playlist import YouTubePlaylist
 from youtube import (
     extract_video_id,
@@ -65,7 +67,16 @@ class Bot(commands.Bot):
         self._skip_seq = 0
         # Web-Player (OBS-Browser-Quelle).
         self.player_token = os.environ.get("PLAYER_TOKEN", "").strip()
+        # Eigener Token fuer die Clip-Endpunkte; faellt auf PLAYER_TOKEN zurueck,
+        # falls nicht gesetzt (so kann man Player und Clips getrennt absichern).
+        self.clips_token = os.environ.get("CLIPS_TOKEN", "").strip() or self.player_token
         self._web_started = False
+        # Clip-Queue: Fallback-Spielzeit pro Clip, falls die echte Laenge nicht
+        # bekannt ist (z.B. ohne Twitch-API). Twitch-Clips sind max. 60 s.
+        self.clip_play_seconds = int(os.environ.get("CLIP_PLAY_SECONDS", "35"))
+        # Twitch Helix API (Client-Credentials) fuer Clip-Metadaten: echter Titel,
+        # Laenge und Existenzpruefung. Aktiv, wenn Client-ID + Secret gesetzt sind.
+        self.twitch_api = TwitchAPI.from_env()
 
     async def event_ready(self):
         print(f"Bot gestartet: {self.nick}")
@@ -76,6 +87,10 @@ class Bot(commands.Bot):
         else:
             print("Längencheck:   INAKTIV (kein YOUTUBE_API_KEY gesetzt)")
         print(f"Witze-Interval:{self.joke_interval // 60} Min.")
+        if self.twitch_api:
+            print("Clip-Queue:    AKTIV (Twitch-API: echter Titel + Laenge) -> /clips")
+        else:
+            print(f"Clip-Queue:    AKTIV ({self.clip_play_seconds}s/Clip, ohne API) -> /clips")
         print(f"Zufallsantworten: {int(self.chat.reply_chance * 100)}% | Combo ab {self.chat.combo_threshold}")
         if self.yt_playlist:
             print("YT-Playlist:   AKTIV (Songrequests werden synchronisiert)")
@@ -367,6 +382,10 @@ class Bot(commands.Bot):
         app.router.add_get("/", self._h_root)
         app.router.add_get("/player", self._h_player)
         app.router.add_get("/overlay", self._h_overlay)
+        app.router.add_get("/clips", self._h_clips_page)
+        app.router.add_get("/api/clips", self._h_clips)
+        app.router.add_post("/api/clips/finished", self._h_clip_finished)
+        app.router.add_get("/api/clips/finished", self._h_clip_finished)
         app.router.add_get("/api/nowplaying", self._h_nowplaying)
         app.router.add_post("/api/nowplaying", self._h_nowplaying_set)
         app.router.add_get("/api/queue", self._h_queue)
@@ -388,6 +407,11 @@ class Bot(commands.Bot):
         if not self.player_token:
             return True  # kein Token gesetzt -> offen (nur fuer Tests empfohlen)
         return request.query.get("token") == self.player_token
+
+    def _check_clip_token(self, request) -> bool:
+        if not self.clips_token:
+            return True  # kein Token gesetzt -> offen (nur fuer Tests empfohlen)
+        return request.query.get("token") == self.clips_token
 
     def _song_json(self, song):
         return {
@@ -420,6 +444,53 @@ class Bot(commands.Bot):
         except FileNotFoundError:
             return web.Response(text="overlay.html nicht gefunden", status=500)
         return web.Response(text=html, content_type="text/html")
+
+    async def _h_clips_page(self, request):
+        """Clip-Overlay fuer OBS (Browser-Quelle) – spielt Clips nacheinander ab."""
+        try:
+            with open("clips.html", encoding="utf-8") as f:
+                html = f.read()
+        except FileNotFoundError:
+            return web.Response(text="clips.html nicht gefunden", status=500)
+        return web.Response(text=html, content_type="text/html")
+
+    async def _h_clips(self, request):
+        """Liefert die Clip-Queue fuer das Overlay (erster Eintrag = laeuft)."""
+        if not self._check_clip_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        clips = self.db.get_clips()
+        items = [
+            {
+                "id": c["id"],
+                "slug": c["slug"],
+                "url": c["url"],
+                "requester": c["requester"],
+                "title": c["title"],
+                "duration": c["duration"] or 0,
+            }
+            for c in clips
+        ]
+        return web.json_response(
+            {
+                "current": items[0] if items else None,
+                "queue": items,
+                "play_seconds": self.clip_play_seconds,
+            }
+        )
+
+    async def _h_clip_finished(self, request):
+        """Overlay meldet: aktueller Clip fertig/abgelaufen -> aus Queue entfernen."""
+        if not self._check_clip_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            cid = int(request.query.get("id", "0"))
+        except ValueError:
+            cid = 0
+        first = self.db.get_first_clip()
+        if first and first["id"] == cid:
+            self.db.remove_clip_by_id(cid)
+            return web.json_response({"ok": True, "removed": cid})
+        return web.json_response({"ok": False, "reason": "not-current"})
 
     async def _h_nowplaying_set(self, request):
         """Player meldet aktuelle Position/Dauer (fuer Restzeit im Overlay)."""
@@ -674,6 +745,106 @@ class Bot(commands.Bot):
         await ctx.send(f"Queue geleert. {count} Song(s) entfernt.")
 
     # ------------------------------------------------------------------ #
+    # Clip Requests (Twitch-Clips)
+    # ------------------------------------------------------------------ #
+
+    @commands.command(name="clip", aliases=["cr", "cliprequest"])
+    async def clip(self, ctx: commands.Context, *, url: str = None):
+        if self.db.get_setting("clip_enabled", "1") != "1":
+            await ctx.send(f"@{ctx.author.name} Clip Requests sind gerade deaktiviert.")
+            return
+        if not url:
+            await ctx.send(f"@{ctx.author.name} Benutze: !clip <Twitch-Clip-Link>")
+            return
+        url = url.strip().split()[0]
+        slug = extract_clip_slug(url)
+        if not slug:
+            await ctx.send(
+                f"@{ctx.author.name} Bitte einen gültigen Twitch-Clip-Link! "
+                f"(clips.twitch.tv/… oder twitch.tv/<kanal>/clip/…)"
+            )
+            return
+        if self.db.clip_exists(slug):
+            await ctx.send(f"@{ctx.author.name} Dieser Clip ist schon in der Queue.")
+            return
+
+        # Mit Twitch-API: echten Titel/Länge holen und Existenz prüfen.
+        title, duration = None, 0
+        clip_url = canonical_clip_url(slug)
+        if self.twitch_api:
+            info = await self.twitch_api.get_clip(slug)
+            if not info:
+                await ctx.send(
+                    f"@{ctx.author.name} Clip nicht gefunden oder nicht verfügbar."
+                )
+                return
+            title = info["title"]
+            duration = info["duration"]
+            clip_url = info.get("url") or clip_url
+
+        _, position = self.db.add_clip(
+            slug, clip_url, ctx.author.name, title=title, duration=duration
+        )
+        what = f"Clip „{title}“" if title else "Clip"
+        when = "spielt als Nächstes" if position == 1 else f"an Position {position} der Clip-Queue"
+        await ctx.send(f"@{ctx.author.name} {what} {when}.")
+
+    @commands.command(name="wrongclip", aliases=["wc"])
+    async def wrongclip(self, ctx: commands.Context):
+        removed = self.db.remove_last_clip_by_requester(ctx.author.name)
+        if not removed:
+            await ctx.send(f"@{ctx.author.name} Du hast keinen Clip in der Queue.")
+            return
+        await ctx.send(f"@{ctx.author.name} Dein letzter Clip wurde entfernt.")
+
+    @commands.command(name="clipqueue", aliases=["cq", "clips"])
+    async def clip_queue(self, ctx: commands.Context):
+        clips = self.db.get_clips()
+        if not clips:
+            await ctx.send("Die Clip-Queue ist leer. Füge mit !clip <Link> Clips hinzu!")
+            return
+        total = len(clips)
+        entries = " | ".join(
+            f"#{i + 1} {c['title'] or 'Clip'} (@{c['requester']})"
+            for i, c in enumerate(clips[:5])
+        )
+        suffix = f" ... und {total - 5} weitere" if total > 5 else ""
+        await ctx.send(f"Clip-Queue ({total} Clips): {entries}{suffix}")
+
+    @commands.command(name="skipclip")
+    async def skip_clip(self, ctx: commands.Context):
+        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
+            await ctx.send(f"@{ctx.author.name} Nur Mods können Clips überspringen.")
+            return
+        first = self.db.get_first_clip()
+        if not first:
+            await ctx.send("Die Clip-Queue ist leer.")
+            return
+        self.db.remove_clip_by_id(first["id"])
+        await ctx.send("Clip übersprungen (nächster Clip).")
+
+    @commands.command(name="clearclips")
+    async def clear_clips(self, ctx: commands.Context):
+        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
+            return
+        count = self.db.clear_clips()
+        await ctx.send(f"Clip-Queue geleert. {count} Clip(s) entfernt.")
+
+    @commands.command(name="clipon")
+    async def clip_on(self, ctx: commands.Context):
+        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
+            return
+        self.db.set_setting("clip_enabled", "1")
+        await ctx.send("Clip Requests sind jetzt AKTIVIERT.")
+
+    @commands.command(name="clipoff")
+    async def clip_off(self, ctx: commands.Context):
+        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
+            return
+        self.db.set_setting("clip_enabled", "0")
+        await ctx.send("Clip Requests sind jetzt DEAKTIVIERT.")
+
+    # ------------------------------------------------------------------ #
     # Mod-Controls
     # ------------------------------------------------------------------ #
 
@@ -721,8 +892,9 @@ class Bot(commands.Bot):
     async def help_cmd(self, ctx: commands.Context):
         await ctx.send(
             "Befehle: !sr <Link> | !wrongsong | !queue | !np | !streamlist | "
-            "!remove <#> | [Mod] !skip | !clearqueue | !sron | !sroff | "
-            "!reactions on/off | !reloademotes"
+            "!remove <#> | !clip <Link> | !wrongclip | !clipqueue | "
+            "[Mod] !skip | !clearqueue | !skipclip | !clearclips | "
+            "!sron | !sroff | !clipon | !clipoff | !reactions on/off | !reloademotes"
         )
 
 

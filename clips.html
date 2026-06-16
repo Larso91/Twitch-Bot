@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clip Queue</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+                font-family: Segoe UI, sans-serif; overflow: hidden; }
+  #clip { width: 100vw; height: 100vh; border: 0; display: block; }
+  #empty { position: fixed; inset: 0; display: flex; align-items: center;
+           justify-content: center; font-size: 28px; opacity: .8; }
+  #info { position: fixed; left: 12px; bottom: 12px; max-width: 80vw;
+          background: rgba(0,0,0,.55); padding: 8px 14px; border-radius: 10px;
+          font-size: 20px; line-height: 1.3; }
+  #info .req { opacity: .7; font-size: 15px; }
+  #status { position: fixed; right: 10px; top: 8px; background: rgba(0,0,0,.5);
+            padding: 3px 8px; border-radius: 6px; font-size: 12px; opacity: .55; }
+</style>
+</head>
+<body>
+<iframe id="clip" allow="autoplay; fullscreen" allowfullscreen style="display:none"></iframe>
+<div id="empty">Warte auf Clips &hellip;</div>
+<div id="info" style="display:none"></div>
+<div id="status"></div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const POLL_MS = 3000;
+let playSeconds = 35;        // wird vom Server ueberschrieben
+let currentId = null;        // id des aktuell gezeigten Clips
+let advanceTimer = null;     // Timer, der nach playSeconds weiterschaltet
+
+function api(path) {
+  const sep = path.includes("?") ? "&" : "?";
+  return path + sep + "token=" + encodeURIComponent(TOKEN);
+}
+function setStatus(t) { document.getElementById("status").textContent = t; }
+
+// Twitch verlangt einen parent-Parameter, der zur Host-Domain passt.
+function embedUrl(slug) {
+  return "https://clips.twitch.tv/embed?clip=" + encodeURIComponent(slug)
+       + "&parent=" + encodeURIComponent(location.hostname)
+       + "&autoplay=true&muted=false";
+}
+
+function loadClip(item) {
+  const frame = document.getElementById("clip");
+  const info = document.getElementById("info");
+  currentId = item.id;
+  frame.src = embedUrl(item.slug);
+  frame.style.display = "block";
+  document.getElementById("empty").style.display = "none";
+  info.style.display = "block";
+  const title = item.title || "Clip";
+  info.innerHTML = title + (item.requester
+      ? ' <span class="req">— von @' + item.requester + "</span>" : "");
+  if (advanceTimer) clearTimeout(advanceTimer);
+  // Echte Clip-Laenge nutzen (+1.5 s Puffer), sonst Fallback playSeconds.
+  const secs = (item.duration && item.duration > 0)
+    ? item.duration + 1.5 : playSeconds;
+  advanceTimer = setTimeout(() => finishCurrent(item.id), secs * 1000);
+}
+
+function showEmpty() {
+  currentId = null;
+  if (advanceTimer) { clearTimeout(advanceTimer); advanceTimer = null; }
+  const frame = document.getElementById("clip");
+  frame.src = "about:blank";
+  frame.style.display = "none";
+  document.getElementById("info").style.display = "none";
+  document.getElementById("empty").style.display = "flex";
+}
+
+async function finishCurrent(id) {
+  if (advanceTimer) { clearTimeout(advanceTimer); advanceTimer = null; }
+  try {
+    await fetch(api("/api/clips/finished?id=" + id), { method: "POST", cache: "no-store" });
+  } catch (e) {}
+  currentId = null;   // naechster Poll laedt den naechsten Clip
+  refresh();
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(api("/api/clips"), { cache: "no-store" });
+    if (!r.ok) { setStatus("API " + r.status); return; }
+    const data = await r.json();
+    if (typeof data.play_seconds === "number" && data.play_seconds > 0) {
+      playSeconds = data.play_seconds;
+    }
+    const cur = data.current;
+    const total = (data.queue || []).length;
+    setStatus(total ? "Clips: " + total : "Queue leer");
+
+    if (!cur) { showEmpty(); return; }
+    // Neuer Clip noetig, wenn nichts laeuft ODER der erste Clip ein anderer
+    // ist (z.B. !skipclip / !clearclips hat den aktuellen entfernt).
+    if (currentId === null || cur.id !== currentId) {
+      loadClip(cur);
+    }
+  } catch (e) { setStatus("Verbindungsfehler"); }
+}
+
+refresh();
+setInterval(refresh, POLL_MS);
+</script>
+</body>
+</html>
