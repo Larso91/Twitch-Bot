@@ -85,6 +85,15 @@ class Bot(commands.Bot):
         # Titel der Raffle-Belohnung (max. 45 Zeichen, im Channel eindeutig).
         self.raffle_title = os.environ.get("RAFFLE_REWARD_TITLE", "🎟️ Verlosung – Los kaufen")
         self.raffle_default_cost = int(os.environ.get("RAFFLE_DEFAULT_COST", "500"))
+        # Auto-Verlosung: startet in einem ZUFAELLIGEN Intervall von selbst, aber
+        # nur wenn der Chat aktiv genug ist (sonst kein Raffle in leeren Chat).
+        self.auto_min_minutes = int(os.environ.get("AUTO_RAFFLE_MIN_MINUTES", "30"))
+        self.auto_max_minutes = int(os.environ.get("AUTO_RAFFLE_MAX_MINUTES", "60"))
+        self.auto_cost = int(os.environ.get("AUTO_RAFFLE_COST", str(self.raffle_default_cost)))
+        self.auto_open_seconds = int(os.environ.get("AUTO_RAFFLE_OPEN_SECONDS", "120"))
+        self.auto_min_chatters = int(os.environ.get("AUTO_RAFFLE_MIN_CHATTERS", "3"))
+        # Eindeutige Chatter seit dem letzten Auto-Raffle (Aktivitaets-Mass).
+        self._chatters = set()
 
     async def event_ready(self):
         print(f"Bot gestartet: {self.nick}")
@@ -118,12 +127,17 @@ class Bot(commands.Bot):
                 self.points.on_redemption = self._on_redemption
                 asyncio.create_task(self.points.run_eventsub())
                 asyncio.create_task(self._raffle_reconcile())
+                asyncio.create_task(self._auto_raffle_loop())
 
     async def event_message(self, message):
         if message.echo:
             return
         content = message.content or ""
         tags = message.tags or {}
+
+        # Aktivitaet messen: eindeutige Chatter fuer die Auto-Verlosung sammeln.
+        if message.author:
+            self._chatters.add(message.author.name.lower())
 
         # BTTV/7TV-Emote-Listen einmalig laden, sobald die Channel-ID bekannt ist.
         if not self._emotes_loaded:
@@ -1000,15 +1014,12 @@ class Bot(commands.Bot):
                 f"Befehle: !raffle start/stop/draw/end/cancel"
             )
 
-    async def _raffle_finalize(self, ctx: commands.Context, refund: bool):
-        """Verlosung abschliessen. refund=True erstattet allen die Punkte
-        (CANCELED), sonst bleiben die Punkte ausgegeben (FULFILLED).
-        Anschliessend Belohnung loeschen und Lose leeren.
+    async def _raffle_cleanup(self, refund: bool) -> int:
+        """Belohnung aufloesen und Lose leeren. refund=True erstattet allen die
+        Punkte (CANCELED), sonst bleiben sie ausgegeben (FULFILLED). Gibt die
+        Anzahl entfernter Lose zurueck. Wird von manueller UND Auto-Verlosung genutzt.
         """
         reward_id = self.db.get_setting("raffle_reward_id", "")
-        if not reward_id and self.db.raffle_entry_count() == 0:
-            await ctx.send("Aktuell läuft keine Verlosung.")
-            return
         ids = self.db.get_raffle_redemption_ids()
         status = "CANCELED" if refund else "FULFILLED"
         if reward_id and ids:
@@ -1018,10 +1029,102 @@ class Bot(commands.Bot):
         n = self.db.clear_raffle()
         self.db.set_setting("raffle_open", "0")
         self.db.set_setting("raffle_reward_id", "")
+        return n
+
+    async def _raffle_finalize(self, ctx: commands.Context, refund: bool):
+        """Verlosung abschliessen (manueller Befehl !raffle end/cancel)."""
+        if not self.db.get_setting("raffle_reward_id", "") and self.db.raffle_entry_count() == 0:
+            await ctx.send("Aktuell läuft keine Verlosung.")
+            return
+        n = await self._raffle_cleanup(refund)
         if refund:
             await ctx.send(f"Verlosung abgebrochen. {n} Lose entfernt, Punkte wurden erstattet.")
         else:
             await ctx.send(f"Verlosung abgeschlossen. {n} Lose archiviert, Belohnung entfernt.")
+
+    # ------------------------------------------------------------------ #
+    # Auto-Verlosung (zufaelliges Intervall, aktivitaets-abhaengig)
+    # ------------------------------------------------------------------ #
+
+    async def _auto_raffle_loop(self):
+        """Startet in einem zufaelligen Intervall von selbst eine Verlosung –
+        aber nur, wenn der Chat aktiv genug ist und gerade keine andere
+        Verlosung laeuft. An/aus per !autoraffle.
+        """
+        while True:
+            wait = random.randint(self.auto_min_minutes, max(self.auto_min_minutes, self.auto_max_minutes))
+            await asyncio.sleep(wait * 60)
+            try:
+                if self.db.get_setting("auto_raffle", "0") != "1":
+                    continue
+                # Laeuft/haengt schon eine (manuelle oder Auto-) Verlosung? -> ueberspringen.
+                if self.db.get_setting("raffle_reward_id", ""):
+                    continue
+                # Chat zu ruhig? -> kein Raffle in den leeren Raum.
+                if len(self._chatters) < self.auto_min_chatters:
+                    continue
+                await self._auto_run_raffle()
+            except Exception as e:
+                print(f"Auto-Verlosung Fehler: {e}")
+
+    async def _auto_run_raffle(self):
+        """Eine komplette Auto-Verlosung: starten -> offen halten -> ziehen."""
+        channel = self.get_channel(self.channel_name)
+        if not channel:
+            return
+        self.db.clear_raffle()
+        reward_id = await self.points.create_reward(self.raffle_title, self.auto_cost)
+        if not reward_id:
+            print("Auto-Verlosung: Belohnung konnte nicht angelegt werden.")
+            return
+        self.db.set_setting("raffle_reward_id", reward_id)
+        self.db.set_setting("raffle_cost", str(self.auto_cost))
+        self.db.set_setting("raffle_open", "1")
+        self._chatters.clear()
+        mins = self.auto_open_seconds // 60
+        await channel.send(
+            f"🎉 Spontane Verlosung! Löse „{self.raffle_title}\" für {self.auto_cost} "
+            f"Punkte ein und sei dabei (mehrere Lose möglich). Gezogen wird in "
+            f"~{mins} Min – viel Glück!"
+        )
+        await asyncio.sleep(self.auto_open_seconds)
+
+        # Annahme schliessen und ziehen.
+        await self.points.set_reward_paused(reward_id, True)
+        self.db.set_setting("raffle_open", "0")
+        entries = self.db.get_raffle_entries()
+        if not entries:
+            await self._raffle_cleanup(refund=False)
+            await channel.send("Schade, niemand hat an der Verlosung teilgenommen. Beim nächsten Mal! 🍀")
+            return
+        winner = random.choice(entries)
+        unique = self.db.raffle_unique_count()
+        await self._raffle_cleanup(refund=False)
+        await channel.send(
+            f"🏆 Die spontane Verlosung gewinnt: @{winner['user_name']}! "
+            f"(aus {len(entries)} Losen von {unique} Teilnehmern) Glückwunsch! 🎉"
+        )
+
+    @commands.command(name="autoraffle", aliases=["autoverlosung"])
+    async def autoraffle(self, ctx: commands.Context, *, mode: str = None):
+        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
+            return
+        if not self.points:
+            await ctx.send("Verlosung ist nicht eingerichtet (TWITCH_BC_REFRESH_TOKEN fehlt).")
+            return
+        mode = (mode or "").strip().lower()
+        if mode in ("on", "an", "1"):
+            self.db.set_setting("auto_raffle", "1")
+            await ctx.send(
+                f"Auto-Verlosung AKTIVIERT: alle ~{self.auto_min_minutes}–{self.auto_max_minutes} "
+                f"Min (bei aktivem Chat) startet automatisch eine Verlosung für {self.auto_cost} Punkte."
+            )
+        elif mode in ("off", "aus", "0"):
+            self.db.set_setting("auto_raffle", "0")
+            await ctx.send("Auto-Verlosung DEAKTIVIERT.")
+        else:
+            state = "AN" if self.db.get_setting("auto_raffle", "0") == "1" else "AUS"
+            await ctx.send(f"Auto-Verlosung ist {state}. Nutze: !autoraffle on/off")
 
     # ------------------------------------------------------------------ #
     # Mod-Controls
@@ -1079,7 +1182,7 @@ class Bot(commands.Bot):
             "Nur Mods/Broadcaster: !skip | !clearqueue | !skipclip | !clearclips "
             "| !sron/!sroff (Songrequests an/aus) | !clipon/!clipoff (Clips an/aus) "
             "| !reactions on/off | !reloademotes | !raffle start/stop/draw/end/cancel "
-            "(Channel-Points-Verlosung)"
+            "(Channel-Points-Verlosung) | !autoraffle on/off (automatische Verlosung)"
         )
 
 

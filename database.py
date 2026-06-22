@@ -64,6 +64,7 @@ class Database:
                 INSERT OR IGNORE INTO settings (key, value) VALUES ('sr_enabled', '1');
                 INSERT OR IGNORE INTO settings (key, value) VALUES ('clip_enabled', '1');
                 INSERT OR IGNORE INTO settings (key, value) VALUES ('raffle_open', '0');
+                INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_raffle', '0');
             """)
             self._migrate(conn)
 
