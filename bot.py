@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import time
 
 # Lokale Entwicklung: Variablen aus einer .env-Datei laden, falls vorhanden.
@@ -21,6 +22,7 @@ from database import Database
 from emotes import fetch_channel_emote_names, twitch_emote_names
 from jokes import get_random_joke
 from twitch_api import TwitchAPI
+from twitch_points import TwitchPoints
 from youtube_playlist import YouTubePlaylist
 from youtube import (
     extract_video_id,
@@ -77,6 +79,12 @@ class Bot(commands.Bot):
         # Twitch Helix API (Client-Credentials) fuer Clip-Metadaten: echter Titel,
         # Laenge und Existenzpruefung. Aktiv, wenn Client-ID + Secret gesetzt sind.
         self.twitch_api = TwitchAPI.from_env()
+        # Channel-Points-Verlosung (Helix + EventSub). Aktiv, wenn zusaetzlich ein
+        # Broadcaster-Refresh-Token (TWITCH_BC_REFRESH_TOKEN) gesetzt ist.
+        self.points = TwitchPoints.from_env()
+        # Titel der Raffle-Belohnung (max. 45 Zeichen, im Channel eindeutig).
+        self.raffle_title = os.environ.get("RAFFLE_REWARD_TITLE", "🎟️ Verlosung – Los kaufen")
+        self.raffle_default_cost = int(os.environ.get("RAFFLE_DEFAULT_COST", "500"))
 
     async def event_ready(self):
         print(f"Bot gestartet: {self.nick}")
@@ -96,12 +104,20 @@ class Bot(commands.Bot):
             print("YT-Playlist:   AKTIV (Songrequests werden synchronisiert)")
         else:
             print("YT-Playlist:   INAKTIV (keine OAuth-Daten gesetzt)")
+        if self.points:
+            print("Verlosung:     AKTIV (Channel Points -> !raffle)")
+        else:
+            print("Verlosung:     INAKTIV (kein TWITCH_BC_REFRESH_TOKEN gesetzt)")
         asyncio.create_task(self._joke_loop())
         if not self._web_started:
             self._web_started = True
             asyncio.create_task(self._start_web())
             if self.yt_playlist:
                 asyncio.create_task(self._playlist_sync_loop())
+            if self.points:
+                self.points.on_redemption = self._on_redemption
+                asyncio.create_task(self.points.run_eventsub())
+                asyncio.create_task(self._raffle_reconcile())
 
     async def event_message(self, message):
         if message.echo:
@@ -845,6 +861,169 @@ class Bot(commands.Bot):
         await ctx.send("Clip Requests sind jetzt DEAKTIVIERT.")
 
     # ------------------------------------------------------------------ #
+    # Verlosung (Channel-Points-Raffle)
+    # ------------------------------------------------------------------ #
+
+    async def _on_redemption(self, event: dict):
+        """EventSub meldet eine Channel-Point-Einloesung.
+
+        Nur Einloesungen der aktiven Raffle-Belohnung zaehlen als Los (jede
+        Einloesung = 1 Los, Mehrfach-Lose erlaubt).
+        """
+        if self.db.get_setting("raffle_open", "0") != "1":
+            return
+        reward_id = self.db.get_setting("raffle_reward_id", "")
+        ev_reward = (event.get("reward") or {}).get("id")
+        if not reward_id or ev_reward != reward_id:
+            return
+        added = self.db.add_raffle_entry(
+            event.get("id", ""),
+            reward_id,
+            str(event.get("user_id", "")),
+            event.get("user_login", ""),
+            event.get("user_name", "") or event.get("user_login", ""),
+        )
+        if added:
+            print(f"Verlosung: Los von @{event.get('user_login')} "
+                  f"({self.db.raffle_entry_count()} Lose gesamt)")
+
+    async def _raffle_reconcile(self):
+        """Nach (Neu-)Start verpasste Einloesungen nachtragen.
+
+        EventSub liefert nur Live-Events – war der Bot kurz offline, fehlen diese
+        Lose. Daher beim Start die offenen Einloesungen der Belohnung nachladen.
+        """
+        if self.db.get_setting("raffle_open", "0") != "1":
+            return
+        reward_id = self.db.get_setting("raffle_reward_id", "")
+        if not reward_id or not self.points:
+            return
+        try:
+            redemptions = await self.points.list_redemptions(reward_id, "UNFULFILLED")
+        except Exception as e:
+            print(f"Verlosung: Reconcile-Fehler: {e}")
+            return
+        new = 0
+        for r in redemptions:
+            user = r.get("user_login", "")
+            if self.db.add_raffle_entry(
+                r.get("id", ""), reward_id, str(r.get("user_id", "")),
+                user, r.get("user_name", "") or user,
+            ):
+                new += 1
+        if new:
+            print(f"Verlosung: {new} verpasste Lose nachgetragen.")
+
+    @commands.command(name="raffle", aliases=["verlosung"])
+    async def raffle(self, ctx: commands.Context, action: str = None, cost: str = None):
+        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
+            await ctx.send(f"@{ctx.author.name} Nur Mods können die Verlosung steuern.")
+            return
+        if not self.points:
+            await ctx.send(
+                "Verlosung ist nicht eingerichtet (TWITCH_BC_REFRESH_TOKEN fehlt)."
+            )
+            return
+
+        action = (action or "status").strip().lower()
+
+        if action == "start":
+            if self.db.get_setting("raffle_open", "0") == "1":
+                await ctx.send("Es läuft bereits eine Verlosung. Erst !raffle draw oder !raffle cancel.")
+                return
+            try:
+                price = int(cost) if cost and cost.isdigit() else self.raffle_default_cost
+            except ValueError:
+                price = self.raffle_default_cost
+            self.db.clear_raffle()
+            reward_id = await self.points.create_reward(self.raffle_title, price)
+            if not reward_id:
+                await ctx.send("Verlosung konnte nicht gestartet werden (Belohnung anlegen fehlgeschlagen).")
+                return
+            self.db.set_setting("raffle_reward_id", reward_id)
+            self.db.set_setting("raffle_cost", str(price))
+            self.db.set_setting("raffle_open", "1")
+            await ctx.send(
+                f"🎟️ Verlosung gestartet! Löse „{self.raffle_title}\" für {price} "
+                f"Punkte ein, um ein Los zu kaufen (mehrere möglich). Viel Glück!"
+            )
+
+        elif action in ("stop", "close"):
+            if self.db.get_setting("raffle_open", "0") != "1":
+                await ctx.send("Aktuell läuft keine Verlosung.")
+                return
+            reward_id = self.db.get_setting("raffle_reward_id", "")
+            await self.points.set_reward_paused(reward_id, True)
+            self.db.set_setting("raffle_open", "0")
+            await ctx.send(
+                f"Verlosung geschlossen – keine neuen Lose mehr. "
+                f"{self.db.raffle_entry_count()} Lose von {self.db.raffle_unique_count()} "
+                f"Teilnehmern. Ziehung mit !raffle draw."
+            )
+
+        elif action in ("draw", "ziehen", "winner"):
+            entries = self.db.get_raffle_entries()
+            if not entries:
+                await ctx.send("Keine Lose vorhanden – noch niemand hat teilgenommen.")
+                return
+            # Annahme automatisch schliessen, falls noch offen.
+            if self.db.get_setting("raffle_open", "0") == "1":
+                reward_id = self.db.get_setting("raffle_reward_id", "")
+                await self.points.set_reward_paused(reward_id, True)
+                self.db.set_setting("raffle_open", "0")
+            winner = random.choice(entries)  # jedes Los = eine Zeile -> faire Gewichtung
+            await ctx.send(
+                f"🎉 Die Verlosung gewinnt: @{winner['user_name']}! "
+                f"(aus {len(entries)} Losen von {self.db.raffle_unique_count()} Teilnehmern) "
+                f"Glückwunsch! 🏆  — !raffle draw für neue Ziehung, !raffle end zum Abschließen."
+            )
+
+        elif action in ("end", "finish"):
+            await self._raffle_finalize(ctx, refund=False)
+
+        elif action in ("cancel", "abbrechen", "refund"):
+            await self._raffle_finalize(ctx, refund=True)
+
+        else:  # status
+            open_now = self.db.get_setting("raffle_open", "0") == "1"
+            count = self.db.raffle_entry_count()
+            if not open_now and count == 0:
+                await ctx.send(
+                    "Keine aktive Verlosung. Start mit !raffle start [Punktekosten]."
+                )
+                return
+            cost_s = self.db.get_setting("raffle_cost", "?")
+            state = "offen" if open_now else "geschlossen"
+            await ctx.send(
+                f"🎟️ Verlosung ({state}): {count} Lose von "
+                f"{self.db.raffle_unique_count()} Teilnehmern, {cost_s} Punkte pro Los. "
+                f"Befehle: !raffle start/stop/draw/end/cancel"
+            )
+
+    async def _raffle_finalize(self, ctx: commands.Context, refund: bool):
+        """Verlosung abschliessen. refund=True erstattet allen die Punkte
+        (CANCELED), sonst bleiben die Punkte ausgegeben (FULFILLED).
+        Anschliessend Belohnung loeschen und Lose leeren.
+        """
+        reward_id = self.db.get_setting("raffle_reward_id", "")
+        if not reward_id and self.db.raffle_entry_count() == 0:
+            await ctx.send("Aktuell läuft keine Verlosung.")
+            return
+        ids = self.db.get_raffle_redemption_ids()
+        status = "CANCELED" if refund else "FULFILLED"
+        if reward_id and ids:
+            await self.points.update_redemptions(reward_id, ids, status)
+        if reward_id:
+            await self.points.delete_reward(reward_id)
+        n = self.db.clear_raffle()
+        self.db.set_setting("raffle_open", "0")
+        self.db.set_setting("raffle_reward_id", "")
+        if refund:
+            await ctx.send(f"Verlosung abgebrochen. {n} Lose entfernt, Punkte wurden erstattet.")
+        else:
+            await ctx.send(f"Verlosung abgeschlossen. {n} Lose archiviert, Belohnung entfernt.")
+
+    # ------------------------------------------------------------------ #
     # Mod-Controls
     # ------------------------------------------------------------------ #
 
@@ -899,7 +1078,8 @@ class Bot(commands.Bot):
         await ctx.send(
             "Nur Mods/Broadcaster: !skip | !clearqueue | !skipclip | !clearclips "
             "| !sron/!sroff (Songrequests an/aus) | !clipon/!clipoff (Clips an/aus) "
-            "| !reactions on/off | !reloademotes"
+            "| !reactions on/off | !reloademotes | !raffle start/stop/draw/end/cancel "
+            "(Channel-Points-Verlosung)"
         )
 
 

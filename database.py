@@ -44,12 +44,26 @@ class Database:
                     duration  REAL DEFAULT 0,
                     added_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+                -- Verlosung (Channel-Points-Raffle): jede Einloesung der
+                -- Raffle-Belohnung ist EIN Los. Mehrfach-Lose erlaubt (mehrere
+                -- Zeilen pro Nutzer). redemption_id ist eindeutig, damit dasselbe
+                -- Event nie doppelt zaehlt (Reconnect/Reconcile).
+                CREATE TABLE IF NOT EXISTS raffle (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    redemption_id TEXT UNIQUE NOT NULL,
+                    reward_id     TEXT NOT NULL,
+                    user_id       TEXT NOT NULL,
+                    user_login    TEXT NOT NULL,
+                    user_name     TEXT NOT NULL,
+                    added_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS settings (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
                 INSERT OR IGNORE INTO settings (key, value) VALUES ('sr_enabled', '1');
                 INSERT OR IGNORE INTO settings (key, value) VALUES ('clip_enabled', '1');
+                INSERT OR IGNORE INTO settings (key, value) VALUES ('raffle_open', '0');
             """)
             self._migrate(conn)
 
@@ -246,6 +260,52 @@ class Database:
     def clear_clips(self) -> int:
         with self._conn() as conn:
             c = conn.execute("DELETE FROM clip_queue")
+            return c.rowcount
+
+    # --- Verlosung (Channel-Points-Raffle) ---
+
+    def add_raffle_entry(self, redemption_id: str, reward_id: str,
+                         user_id: str, user_login: str, user_name: str) -> bool:
+        """Ein Los hinzufuegen. Doppelte redemption_id werden ignoriert.
+
+        Gibt True zurueck, wenn ein neues Los eingetragen wurde.
+        """
+        with self._conn() as conn:
+            c = conn.execute(
+                "INSERT OR IGNORE INTO raffle "
+                "(redemption_id, reward_id, user_id, user_login, user_name) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (redemption_id, reward_id, user_id, user_login, user_name),
+            )
+            return c.rowcount > 0
+
+    def get_raffle_entries(self) -> List[Dict]:
+        with self._conn() as conn:
+            return [
+                dict(r)
+                for r in conn.execute("SELECT * FROM raffle ORDER BY id ASC")
+            ]
+
+    def raffle_entry_count(self) -> int:
+        with self._conn() as conn:
+            return conn.execute("SELECT COUNT(*) FROM raffle").fetchone()[0]
+
+    def raffle_unique_count(self) -> int:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM raffle"
+            ).fetchone()[0]
+
+    def get_raffle_redemption_ids(self) -> List[str]:
+        with self._conn() as conn:
+            return [
+                r["redemption_id"]
+                for r in conn.execute("SELECT redemption_id FROM raffle")
+            ]
+
+    def clear_raffle(self) -> int:
+        with self._conn() as conn:
+            c = conn.execute("DELETE FROM raffle")
             return c.rowcount
 
     # --- Settings ---
