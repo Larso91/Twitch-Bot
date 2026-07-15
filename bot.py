@@ -16,10 +16,8 @@ except ImportError:
 from aiohttp import web
 from twitchio.ext import commands
 
-from chat import ChatExtras
 from clips import canonical_clip_url, extract_clip_slug, is_valid_clip_url
 from database import Database
-from emotes import fetch_channel_emote_names, twitch_emote_names
 from jokes import get_random_joke
 from twitch_api import TwitchAPI
 from twitch_points import TwitchPoints
@@ -44,16 +42,9 @@ class Bot(commands.Bot):
         self.channel_name = os.environ["TWITCH_CHANNEL"].lower()
         self.joke_interval = int(os.environ.get("JOKE_INTERVAL_MINUTES", "30")) * 60
         self.yt_api_key = os.environ.get("YOUTUBE_API_KEY", "")
-        self.max_duration = int(os.environ.get("MAX_SONG_DURATION_MINUTES", "5"))
+        self.max_duration = int(os.environ.get("MAX_SONG_DURATION_MINUTES", "7"))
         # Datei, in die die dauerhaft wachsende Streamliste geschrieben wird.
         self.streamlist_file = os.environ.get("STREAMLIST_FILE", "streamlist.txt")
-        # Zufallsantworten + Emoji-Combos.
-        self.chat = ChatExtras(
-            reply_chance=float(os.environ.get("RANDOM_REPLY_CHANCE", "0.15")),
-            combo_threshold=int(os.environ.get("COMBO_THRESHOLD", "3")),
-        )
-        self._emotes_loaded = False
-        self._room_id = None
         # YouTube-Playlist-Sync (nur aktiv, wenn OAuth-Daten gesetzt sind).
         self.yt_playlist = YouTubePlaylist.from_env()
         # In-Memory-Abbild der YouTube-Playlist (Wiedergabe-Quelle des Players).
@@ -108,7 +99,6 @@ class Bot(commands.Bot):
             print("Clip-Queue:    AKTIV (Twitch-API: echter Titel + Laenge) -> /clips")
         else:
             print(f"Clip-Queue:    AKTIV ({self.clip_play_seconds}s/Clip, ohne API) -> /clips")
-        print(f"Zufallsantworten: {int(self.chat.reply_chance * 100)}% | Combo ab {self.chat.combo_threshold}")
         if self.yt_playlist:
             print("YT-Playlist:   AKTIV (Songrequests werden synchronisiert)")
         else:
@@ -132,36 +122,12 @@ class Bot(commands.Bot):
     async def event_message(self, message):
         if message.echo:
             return
-        content = message.content or ""
-        tags = message.tags or {}
 
         # Aktivitaet messen: eindeutige Chatter fuer die Auto-Verlosung sammeln.
         if message.author:
             self._chatters.add(message.author.name.lower())
 
-        # BTTV/7TV-Emote-Listen einmalig laden, sobald die Channel-ID bekannt ist.
-        if not self._emotes_loaded:
-            room_id = tags.get("room-id")
-            if room_id:
-                self._emotes_loaded = True
-                self._room_id = room_id
-                asyncio.create_task(self._load_emotes(room_id))
-
-        # Auf Nicht-Befehle reagieren: Emote-Combos & Zufallsantworten.
-        if not content.startswith("!") and self.db.get_setting("reactions_enabled", "1") == "1":
-            tw_emotes = twitch_emote_names(content, tags.get("emotes"))
-            reply = self.chat.process(content, twitch_emotes=tw_emotes)
-            if reply and message.channel:
-                await message.channel.send(reply)
         await self.handle_commands(message)
-
-    async def _load_emotes(self, room_id):
-        try:
-            names = await fetch_channel_emote_names(room_id)
-            self.chat.set_word_emotes(names)
-            print(f"Emotes geladen: {len(names)} BTTV/7TV-Emotes (Channel-ID {room_id})")
-        except Exception as e:
-            print(f"Emotes konnten nicht geladen werden: {e}")
 
     async def _joke_loop(self):
         await asyncio.sleep(10)
@@ -1144,32 +1110,6 @@ class Bot(commands.Bot):
         self.db.set_setting("sr_enabled", "0")
         await ctx.send("Song Requests sind jetzt DEAKTIVIERT.")
 
-    @commands.command(name="reactions", aliases=["reaktionen"])
-    async def reactions(self, ctx: commands.Context, *, mode: str = None):
-        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
-            return
-        mode = (mode or "").strip().lower()
-        if mode in ("on", "an", "1"):
-            self.db.set_setting("reactions_enabled", "1")
-            await ctx.send("Chat-Reaktionen (Zufallsantworten & Emoji-Combos) AKTIVIERT.")
-        elif mode in ("off", "aus", "0"):
-            self.db.set_setting("reactions_enabled", "0")
-            await ctx.send("Chat-Reaktionen DEAKTIVIERT.")
-        else:
-            state = "AN" if self.db.get_setting("reactions_enabled", "1") == "1" else "AUS"
-            await ctx.send(f"Chat-Reaktionen sind {state}. Nutze: !reactions on/off")
-
-    @commands.command(name="reloademotes")
-    async def reload_emotes(self, ctx: commands.Context):
-        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
-            return
-        if not self._room_id:
-            await ctx.send("Channel-ID noch nicht bekannt – bitte gleich nochmal versuchen.")
-            return
-        names = await fetch_channel_emote_names(self._room_id)
-        self.chat.set_word_emotes(names)
-        await ctx.send(f"Emote-Listen neu geladen: {len(names)} BTTV/7TV-Emotes.")
-
     @commands.command(name="commands", aliases=["hilfe", "help", "befehle"])
     async def help_cmd(self, ctx: commands.Context):
         await ctx.send(
@@ -1181,7 +1121,7 @@ class Bot(commands.Bot):
         await ctx.send(
             "Nur Mods/Broadcaster: !skip | !clearqueue | !skipclip | !clearclips "
             "| !sron/!sroff (Songrequests an/aus) | !clipon/!clipoff (Clips an/aus) "
-            "| !reactions on/off | !reloademotes | !raffle start/stop/draw/end/cancel "
+            "| !raffle start/stop/draw/end/cancel "
             "(Channel-Points-Verlosung) | !autoraffle on/off (automatische Verlosung)"
         )
 
