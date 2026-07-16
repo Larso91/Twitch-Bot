@@ -44,6 +44,9 @@ class Bot(commands.Bot):
         self.joke_interval = int(os.environ.get("JOKE_INTERVAL_MINUTES", "30")) * 60
         self.yt_api_key = os.environ.get("YOUTUBE_API_KEY", "")
         self.max_duration = int(os.environ.get("MAX_SONG_DURATION_MINUTES", "7"))
+        # Automatische Queue-Bereinigung: SQLite-Eintraege aelter als X Stunden loeschen.
+        # 0 = deaktiviert. Betrifft NUR die !sr-Queue, NICHT die YouTube-Playlist.
+        self.queue_max_age_hours = int(os.environ.get("QUEUE_MAX_AGE_HOURS", "24"))
         # Datei, in die die dauerhaft wachsende Streamliste geschrieben wird.
         self.streamlist_file = os.environ.get("STREAMLIST_FILE", "streamlist.txt")
         # YouTube-Playlist-Sync (nur aktiv, wenn OAuth-Daten gesetzt sind).
@@ -93,6 +96,10 @@ class Bot(commands.Bot):
         print(f"Bot gestartet: {self.nick}")
         print(f"Kanal:         {self.channel_name}")
         print(f"Max. Länge:    {self.max_duration} Min.")
+        if self.queue_max_age_hours > 0:
+            print(f"Queue-Cleanup: Eintraege aelter als {self.queue_max_age_hours}h werden automatisch geloescht")
+        else:
+            print("Queue-Cleanup: DEAKTIVIERT (QUEUE_MAX_AGE_HOURS=0)")
         if self.yt_api_key:
             print("Längencheck:   AKTIV (YouTube API Key gefunden)")
         else:
@@ -112,6 +119,8 @@ class Bot(commands.Bot):
             print("Verlosung:     INAKTIV (kein TWITCH_BC_REFRESH_TOKEN gesetzt)")
         asyncio.create_task(self._joke_loop())
         asyncio.create_task(self._wordgame_loop())
+        if self.queue_max_age_hours > 0:
+            asyncio.create_task(self._queue_cleanup_loop())
         if not self._web_started:
             self._web_started = True
             asyncio.create_task(self._start_web())
@@ -158,6 +167,31 @@ class Bot(commands.Bot):
 
         print(f"Woerterraetsel: alle {self.wordgame.min_minutes}\u2013{self.wordgame.max_minutes} Min. automatisch")
         await self.wordgame.run_loop(send)
+
+    async def _queue_cleanup_loop(self):
+        """Loescht SQLite-Queue-Eintraege, die aelter als queue_max_age_hours sind.
+
+        Laeuft einmal pro Stunde. Entfernt NUR die lokale Request-Queue – die
+        YouTube-Playlist bleibt vollstaendig erhalten. Dadurch werden 'festgesteckte'
+        Eintraege automatisch bereinigt, sodass neue Requests nicht ewig hinten
+        angestellt werden.
+        """
+        # Beim Start kurz warten, dann direkt einmal aufraeumen.
+        await asyncio.sleep(60)
+        while True:
+            try:
+                expired = self.db.get_expired_songs(self.queue_max_age_hours)
+                if expired:
+                    removed = self.db.remove_expired_songs(self.queue_max_age_hours)
+                    print(
+                        f"Queue-Cleanup: {removed} Eintraege aelter als "
+                        f"{self.queue_max_age_hours}h entfernt (nur SQLite-Queue, "
+                        f"YouTube-Playlist unberuehrt)."
+                    )
+            except Exception as e:
+                print(f"Queue-Cleanup Fehler: {e}")
+            # Naechste Pruefung in einer Stunde.
+            await asyncio.sleep(3600)
 
     async def _joke_loop(self):
         await asyncio.sleep(10)
