@@ -19,6 +19,7 @@ from twitchio.ext import commands
 from clips import canonical_clip_url, extract_clip_slug, is_valid_clip_url
 from database import Database
 from jokes import get_random_joke
+from wordgame import WordGame
 from twitch_api import TwitchAPI
 from twitch_points import TwitchPoints
 from youtube_playlist import YouTubePlaylist
@@ -85,6 +86,8 @@ class Bot(commands.Bot):
         self.auto_min_chatters = int(os.environ.get("AUTO_RAFFLE_MIN_CHATTERS", "3"))
         # Eindeutige Chatter seit dem letzten Auto-Raffle (Aktivitaets-Mass).
         self._chatters = set()
+        # Automatisches Woerterraetsel
+        self.wordgame = WordGame.from_env()
 
     async def event_ready(self):
         print(f"Bot gestartet: {self.nick}")
@@ -108,6 +111,7 @@ class Bot(commands.Bot):
         else:
             print("Verlosung:     INAKTIV (kein TWITCH_BC_REFRESH_TOKEN gesetzt)")
         asyncio.create_task(self._joke_loop())
+        asyncio.create_task(self._wordgame_loop())
         if not self._web_started:
             self._web_started = True
             asyncio.create_task(self._start_web())
@@ -127,7 +131,33 @@ class Bot(commands.Bot):
         if message.author:
             self._chatters.add(message.author.name.lower())
 
+        # Woerterraetsel: Guess pruefen (vor handle_commands).
+        content = message.content or ""
+        if not content.startswith("!") and message.author:
+            if self.wordgame.check_guess(content):
+                self.wordgame.solve()
+                channel = self.get_channel(self.channel_name)
+                if channel:
+                    await channel.send(
+                        f"\U0001f389 @{message.author.name} hat es! "
+                        f"Die Loesung war \u00bb {self.wordgame._current_word} \u00ab "
+                        f"\u2013 Glueckwunsch! "
+                        f"Naechstes Raetsel kommt bald \U0001f524"
+                    )
+
         await self.handle_commands(message)
+
+    async def _wordgame_loop(self):
+        channel_ref = [None]
+
+        async def send(text: str):
+            if channel_ref[0] is None:
+                channel_ref[0] = self.get_channel(self.channel_name)
+            if channel_ref[0]:
+                await channel_ref[0].send(text)
+
+        print(f"Woerterraetsel: alle {self.wordgame.min_minutes}\u2013{self.wordgame.max_minutes} Min. automatisch")
+        await self.wordgame.run_loop(send)
 
     async def _joke_loop(self):
         await asyncio.sleep(10)
