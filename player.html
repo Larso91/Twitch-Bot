@@ -5,33 +5,108 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Song Request Player</title>
 <style>
+  *, *::before, *::after { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: #000; color: #fff;
-                font-family: Segoe UI, sans-serif; overflow: hidden; }
-  #player { width: 100vw; height: 100vh; }
-  #info { position: fixed; left: 12px; bottom: 12px; max-width: 80vw;
-          background: rgba(0,0,0,.55); padding: 8px 14px; border-radius: 10px;
-          font-size: 20px; line-height: 1.3; }
-  #info .req { opacity: .7; font-size: 15px; }
-  #status { position: fixed; right: 10px; top: 8px; background: rgba(0,0,0,.5);
-            padding: 3px 8px; border-radius: 6px; font-size: 12px; opacity: .55; }
+               font-family: Segoe UI, sans-serif; overflow: hidden; }
+
+  /* ---- Layout ---- */
+  #wrap { display: flex; height: 100vh; }
+  #player-col { flex: 1 1 auto; position: relative; min-width: 0; }
+  #player { width: 100%; height: 100%; }
+
+  /* ---- Playlist-Sidebar ---- */
+  #sidebar {
+    flex: 0 0 320px; width: 320px;
+    background: #111; display: flex; flex-direction: column;
+    border-left: 1px solid #222; transition: width .25s ease, flex-basis .25s ease;
+  }
+  #sidebar.collapsed { flex-basis: 0; width: 0; overflow: hidden; }
+
+  #sidebar-header {
+    padding: 12px 14px 10px; background: #1a1a1a;
+    border-bottom: 1px solid #2a2a2a;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-shrink: 0;
+  }
+  #sidebar-header span { font-weight: 600; font-size: 14px; color: #ccc; }
+  #sidebar-header small { color: #666; font-size: 11px; margin-left: 6px; }
+
+  #playlist-list {
+    flex: 1 1 auto; overflow-y: auto; padding: 6px 0;
+  }
+  #playlist-list::-webkit-scrollbar { width: 5px; }
+  #playlist-list::-webkit-scrollbar-track { background: #111; }
+  #playlist-list::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
+  .pl-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; cursor: pointer; border-radius: 6px; margin: 2px 6px;
+    transition: background .15s;
+  }
+  .pl-item:hover { background: #222; }
+  .pl-item.active { background: #1e1245; border-left: 3px solid #9146ff; padding-left: 9px; }
+  .pl-num { font-size: 11px; color: #555; width: 20px; text-align: right; flex-shrink: 0; }
+  .pl-item.active .pl-num { color: #9146ff; }
+  .pl-thumb { width: 48px; height: 27px; border-radius: 3px; object-fit: cover;
+              background: #1a1a1a; flex-shrink: 0; }
+  .pl-meta { flex: 1; min-width: 0; }
+  .pl-title { font-size: 12px; white-space: nowrap; overflow: hidden;
+              text-overflow: ellipsis; color: #ddd; }
+  .pl-item.active .pl-title { color: #fff; font-weight: 600; }
+  .pl-req { font-size: 10px; color: #666; margin-top: 2px; }
+  .pl-now { font-size: 10px; color: #9146ff; margin-top: 1px; }
+
+  /* ---- Toggle-Button ---- */
+  #toggle-btn {
+    position: fixed; right: 0; top: 50%; transform: translateY(-50%);
+    background: #1a1a1a; border: 1px solid #333; border-right: none;
+    color: #aaa; padding: 10px 6px; cursor: pointer; border-radius: 6px 0 0 6px;
+    font-size: 16px; z-index: 100; transition: background .15s;
+    writing-mode: horizontal-tb;
+  }
+  #toggle-btn:hover { background: #222; color: #fff; }
+  body.sidebar-open #toggle-btn { right: 320px; }
+
+  /* ---- Info-Box (Now Playing) ---- */
+  #info { position: fixed; left: 12px; bottom: 12px; max-width: 60vw;
+          background: rgba(0,0,0,.6); padding: 8px 14px; border-radius: 10px;
+          font-size: 18px; line-height: 1.3; pointer-events: none; }
+  #info .req { opacity: .7; font-size: 14px; }
+
+  #status { position: fixed; left: 12px; top: 8px; background: rgba(0,0,0,.5);
+            padding: 3px 8px; border-radius: 6px; font-size: 11px; opacity: .55; }
+
   #overlay { position: fixed; inset: 0; display: none; align-items: center;
-             justify-content: center; background: #000; font-size: 24px; opacity: .85; }
+             justify-content: center; background: #000; font-size: 24px; opacity: .85;
+             z-index: 200; }
 </style>
 </head>
 <body>
-<div id="player"></div>
+<div id="wrap">
+  <div id="player-col">
+    <div id="player"></div>
+  </div>
+  <div id="sidebar" class="collapsed">
+    <div id="sidebar-header">
+      <div><span>Warteschlange</span><small id="pl-count"></small></div>
+    </div>
+    <div id="playlist-list"></div>
+  </div>
+</div>
+
 <div id="info">Warte auf Songs &hellip;</div>
 <div id="status"></div>
+<button id="toggle-btn" title="Playlist ein-/ausblenden">☰</button>
 <div id="overlay">Zum Starten klicken</div>
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
 const POLL_MS = 3000;
 let player, ready = false;
-let items = [];              // persistente Playlist [{item_id, video_id, title, requester}]
-let currentVid = null;       // video_id des laufenden Songs
-let currentIdx = 0;          // Index des laufenden Songs (Fallback bei Listenaenderung)
-let lastSkipSeq = null;      // zuletzt gesehener Skip-Zaehler vom Server
+let items = [];
+let currentVid = null;
+let currentIdx = 0;
+let lastSkipSeq = null;
 
 function api(path) {
   const sep = path.includes("?") ? "&" : "?";
@@ -42,12 +117,14 @@ function setStatus(t) { document.getElementById("status").textContent = t; }
 function indexOfCurrent() {
   return items.findIndex((it) => it.video_id === currentVid);
 }
+
 function setInfo() {
   const it = items[indexOfCurrent()];
   document.getElementById("info").innerHTML = it
     ? it.title + (it.requester ? ' <span class="req">— @' + it.requester + "</span>" : "")
     : "Warte auf Songs &hellip;";
 }
+
 function updateMediaMetadata() {
   if (!("mediaSession" in navigator) || !window.MediaMetadata) return;
   const it = items[indexOfCurrent()];
@@ -60,12 +137,65 @@ function updateMediaMetadata() {
   } catch (e) {}
 }
 
-// ---- Wiedergabe per Index; nichts wird geloescht; am Ende -> Loop ----
+// ---- Playlist-Sidebar rendern ----
+function renderPlaylist() {
+  const list = document.getElementById("playlist-list");
+  const ci = indexOfCurrent();
+  document.getElementById("pl-count").textContent =
+    items.length ? " · " + items.length + " Songs" : "";
+
+  // Nur neu rendern wenn nötig (Anzahl oder aktiver Index geändert)
+  const prev = list.dataset.rendered;
+  const sig = items.length + ":" + ci;
+  if (prev === sig) return;
+  list.dataset.rendered = sig;
+
+  list.innerHTML = "";
+  items.forEach((it, i) => {
+    const div = document.createElement("div");
+    div.className = "pl-item" + (i === ci ? " active" : "");
+    div.innerHTML =
+      `<span class="pl-num">${i + 1}</span>` +
+      `<img class="pl-thumb" src="https://i.ytimg.com/vi/${it.video_id}/default.jpg" loading="lazy">` +
+      `<div class="pl-meta">` +
+        `<div class="pl-title" title="${escHtml(it.title)}">${escHtml(it.title)}</div>` +
+        (it.requester ? `<div class="pl-req">@${escHtml(it.requester)}</div>` : "") +
+        (i === ci ? `<div class="pl-now">▶ läuft gerade</div>` : "") +
+      `</div>`;
+    div.addEventListener("click", () => playAt(i));
+    list.appendChild(div);
+  });
+
+  // Aktiven Song in der Liste sichtbar scrollen
+  if (ci >= 0) {
+    const active = list.querySelector(".active");
+    if (active) active.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function escHtml(s) {
+  return (s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+// ---- Sidebar Toggle ----
+const sidebar = document.getElementById("sidebar");
+const toggleBtn = document.getElementById("toggle-btn");
+let sidebarOpen = false;
+
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  sidebar.classList.toggle("collapsed", !sidebarOpen);
+  document.body.classList.toggle("sidebar-open", sidebarOpen);
+  toggleBtn.textContent = sidebarOpen ? "✕" : "☰";
+}
+toggleBtn.addEventListener("click", toggleSidebar);
+
+// ---- Wiedergabe ----
 function playAt(i) {
   if (!items.length) {
     currentVid = null;
     try { player.stopVideo(); } catch (e) {}
-    setInfo();
+    setInfo(); renderPlaylist();
     return;
   }
   i = ((i % items.length) + items.length) % items.length;
@@ -74,15 +204,18 @@ function playAt(i) {
   player.loadVideoById(items[i].video_id);
   setInfo();
   updateMediaMetadata();
+  renderPlaylist();
 }
+
 function advance() {
   if (!items.length) return;
   const ci = indexOfCurrent();
-  playAt(ci >= 0 ? ci + 1 : currentIdx);   // Loop ueber Modulo in playAt
+  playAt(ci >= 0 ? ci + 1 : currentIdx);
 }
+
 function restartSong() { try { player.seekTo(0, true); player.playVideo(); } catch (e) {} }
 
-// ---- Steuerung: NUR Medientasten ----
+// ---- Media Session ----
 function setupMediaSession() {
   if (!("mediaSession" in navigator)) return;
   try {
@@ -108,25 +241,21 @@ function onYouTubeIframeAPIReady() {
         setInterval(reportNow, 2000);
       },
       onStateChange: onState,
-      // nicht abspielbar (privat/geloescht) -> ueberspringen (nicht loeschen).
-      // Kleiner Delay, damit es bei mehreren defekten Songs keine Hot-Loop gibt.
       onError: () => setTimeout(advance, 800),
     },
   });
 }
+
 function onState(e) {
-  if (e.data === YT.PlayerState.ENDED) advance();   // Songende -> naechster, ohne Loeschen
+  if (e.data === YT.PlayerState.ENDED) advance();
 }
 
-// Position/Dauer ans Overlay melden.
 async function reportNow() {
   if (!ready || currentVid == null) return;
   let pos = 0, dur = 0, playing = false;
   try { pos = player.getCurrentTime() || 0; } catch (e) {}
   try { dur = player.getDuration() || 0; } catch (e) {}
   try { playing = player.getPlayerState() === YT.PlayerState.PLAYING; } catch (e) {}
-  // Titel + Requester des wirklich laufenden Songs mitschicken, damit das
-  // OBS-Overlay zuverlaessig den richtigen Song anzeigt.
   const it = items[indexOfCurrent()] || {};
   try {
     await fetch(api("/api/nowplaying"), {
@@ -158,8 +287,9 @@ async function refresh() {
 
     items = (data.items || []).filter((it) => it.video_id);
     setStatus(items.length ? "Songs: " + items.length : "Playlist leer");
+    renderPlaylist();
 
-    // Skip-Signal vom Server (!skip / Media_Next via AHK).
+    // Skip-Signal
     if (lastSkipSeq === null) {
       lastSkipSeq = data.skip_seq;
     } else if (data.skip_seq !== lastSkipSeq) {
@@ -171,16 +301,15 @@ async function refresh() {
     if (!items.length) { currentVid = null; setInfo(); return; }
 
     if (currentVid === null) {
-      playAt(0);                 // Erststart
+      playAt(0);
     } else if (indexOfCurrent() === -1) {
-      playAt(currentIdx);        // laufender Song wurde entfernt -> an gleicher Stelle weiter
+      playAt(currentIdx);
     } else {
-      setInfo();                 // laeuft weiter -> nicht unterbrechen
+      setInfo();
     }
   } catch (e) { setStatus("Verbindungsfehler"); }
 }
 
-// Falls der Browser Autoplay mit Ton blockiert (normaler Tab): ein Klick startet.
 document.getElementById("overlay").addEventListener("click", () => {
   document.getElementById("overlay").style.display = "none";
   if (player && player.playVideo) player.playVideo();
