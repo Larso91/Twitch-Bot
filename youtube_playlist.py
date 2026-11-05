@@ -20,6 +20,7 @@ import aiohttp
 
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _API_BASE = "https://www.googleapis.com/youtube/v3/playlistItems"
+_PLAYLISTS_API = "https://www.googleapis.com/youtube/v3/playlists"
 _TIMEOUT = aiohttp.ClientTimeout(total=10)
 _UNSET = object()  # Sentinel: "kein position-Argument uebergeben"
 
@@ -37,6 +38,9 @@ class YouTubePlaylist:
         self.insert_position = insert_position
         self._access_token: Optional[str] = None
         self._expires_at: float = 0.0
+        # Gesamtzahl laut YouTube beim letzten erfolgreichen list() (inkl.
+        # nicht abspielbarer Eintraege) – Vergleichswert fuer count().
+        self.last_total: Optional[int] = None
 
     @classmethod
     def from_env(cls) -> Optional["YouTubePlaylist"]:
@@ -148,17 +152,53 @@ class YouTubePlaylist:
         except Exception:
             return False
 
-    async def list(self) -> list:
+    async def count(self) -> Optional[int]:
+        """Anzahl der Eintraege laut YouTube (playlists.list, nur 1 Quota-Einheit).
+
+        Guenstiger Aenderungs-Check: weicht die Zahl vom letzten Stand ab
+        (z.B. weil im Browser ein Song geloescht wurde), wird neu geladen.
+        Gibt None bei Fehlern zurueck.
+        """
+        token = await self._get_access_token()
+        if not token:
+            return None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    _PLAYLISTS_API,
+                    params={"part": "contentDetails", "id": self.playlist_id},
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=_TIMEOUT,
+                ) as resp:
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        print(f"[YT] Count-Fehler {resp.status}: {txt[:200]}")
+                        return None
+                    j = await resp.json()
+                    items = j.get("items") or []
+                    if not items:
+                        return None
+                    return int((items[0].get("contentDetails") or {}).get("itemCount", 0))
+        except Exception as e:
+            print(f"[YT] Count-Ausnahme: {e}")
+            return None
+
+    async def list(self) -> Optional[list]:
         """Liest die komplette Playlist aus (in Reihenfolge).
 
         Gibt eine Liste von Dicts zurueck:
             {"item_id": ..., "video_id": ..., "title": ...}
         Nicht abspielbare/geloeschte Eintraege ohne Video-ID werden uebersprungen.
+
+        Bei JEDEM Fehler (Token, Quota, Netzwerk, Abbruch mitten in den Seiten)
+        wird None zurueckgegeben – NICHT eine leere/halbe Liste. Sonst wuerde der
+        Bot bei einem kurzen API-Problem die Playlist im Player leeren.
         """
         token = await self._get_access_token()
         if not token:
-            return []
+            return None
         items: list = []
+        total: Optional[int] = None
         page: Optional[str] = None
         try:
             async with aiohttp.ClientSession() as session:
@@ -179,8 +219,10 @@ class YouTubePlaylist:
                         if resp.status != 200:
                             txt = await resp.text()
                             print(f"[YT] List-Fehler {resp.status}: {txt[:200]}")
-                            return items
+                            return None
                         j = await resp.json()
+                        if total is None:
+                            total = (j.get("pageInfo") or {}).get("totalResults")
                         for it in j.get("items", []):
                             cd = it.get("contentDetails") or {}
                             sn = it.get("snippet") or {}
@@ -199,4 +241,6 @@ class YouTubePlaylist:
                             break
         except Exception as e:
             print(f"[YT] List-Ausnahme: {e}")
+            return None
+        self.last_total = int(total) if total is not None else None
         return items

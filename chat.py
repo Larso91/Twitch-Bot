@@ -1,4 +1,3 @@
-import random
 import re
 from typing import Optional, Tuple
 
@@ -63,47 +62,17 @@ def parse_emoji_combo(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-# ------------------------------------------------------------------ #
-# Zufällige Antworten
-# ------------------------------------------------------------------ #
-
-# Mix aus lockeren Sprüchen und kurzen Hype-Reaktionen.
-# Einfach erweitern oder anpassen.
-_RESPONSES = [
-    # Lustige / lockere Sprüche
-    "Haha, der war gut! 😂",
-    "Das musste jetzt mal gesagt werden 😄",
-    "Big Brain Moment 🧠",
-    "Ich hab's gehört, ich hab's gehört 👀",
-    "Da ist was dran, nicht schlecht!",
-    "Klassiker im Chat 😎",
-    "Genau mein Humor 😂",
-    "Ohne Worte... aber trotzdem gut!",
-    # Hype / Reaktionen
-    "POGGERS! 🎉",
-    "Let's gooo! 🚀",
-    "Stark! 💪",
-    "LOL 😆",
-    "Das war clean!",
-    "Chat ist heute on fire 🔥",
-    "GG! 🏆",
-    "Hype im Chat! 🙌",
-    "Sauber gemacht!",
-    "W im Chat 👑",
-]
-
-
 class ChatExtras:
-    """Zustandsbehaftete Logik für Emoji-Combos und zufällige Antworten."""
+    """Zustandsbehaftete Logik für Emoji-Combos (keine Zufallsantworten mehr)."""
 
-    def __init__(self, reply_chance: float = 0.15, combo_threshold: int = 3):
-        self.reply_chance = reply_chance
+    def __init__(self, combo_threshold: int = 3):
         self.combo_threshold = max(2, combo_threshold)
         # Bekannte Wort-Emotes (BTTV/7TV), per API geladen.
         self.word_emotes: set = set()
         self._combo_key: Optional[str] = None
         self._combo_display: str = ""
         self._combo_count: int = 0
+        self._combo_announced: bool = False
 
     def set_word_emotes(self, names: set) -> None:
         self.word_emotes = set(names)
@@ -128,6 +97,7 @@ class ChatExtras:
         self._combo_key = None
         self._combo_display = ""
         self._combo_count = 0
+        self._combo_announced = False
 
     def _feed_emoji(self, display: str, key: str) -> Optional[str]:
         if key == self._combo_key:
@@ -136,12 +106,11 @@ class ChatExtras:
             self._combo_key = key
             self._combo_display = display
             self._combo_count = 1
-        # Bei Erreichen der Schwelle ansagen, danach an jedem weiteren
-        # Vielfachen (z.B. 3, 6, 9 ...) – so kein Spam bei jeder Nachricht.
-        if (
-            self._combo_count >= self.combo_threshold
-            and self._combo_count % self.combo_threshold == 0
-        ):
+            self._combo_announced = False
+        # Nur EINMAL pro Combo ansagen (beim Erreichen der Schwelle) – kein
+        # Nachlegen bei 6, 9, 12 ... mehr, damit der Bot den Chat nicht flutet.
+        if self._combo_count >= self.combo_threshold and not self._combo_announced:
+            self._combo_announced = True
             return f"{self._combo_display} x{self._combo_count} Combo! 🔥"
         return None
 
@@ -150,7 +119,7 @@ class ChatExtras:
 
         - Emote-only-Nachrichten (Unicode-Emoji, Twitch-, BTTV- oder 7TV-Emote)
           zählen die Combo hoch.
-        - Andere Nachrichten brechen die Combo und lösen ggf. eine Zufallsantwort aus.
+        - Andere Nachrichten brechen die Combo (keine Zufallsantworten mehr).
 
         twitch_emotes: Namen der von Twitch in dieser Nachricht erkannten Emotes.
         """
@@ -159,6 +128,4 @@ class ChatExtras:
             return self._feed_emoji(*combo)
         # Kein reines Emoji -> laufende Combo ist beendet.
         self._reset_combo()
-        if random.random() < self.reply_chance:
-            return random.choice(_RESPONSES)
         return None

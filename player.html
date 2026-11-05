@@ -30,6 +30,10 @@
   }
   #sidebar-header span { font-weight: 600; font-size: 14px; color: #ccc; }
   #sidebar-header small { color: #666; font-size: 11px; margin-left: 6px; }
+  #sync-btn { background: #222; border: 1px solid #333; color: #aaa; border-radius: 5px;
+              font-size: 12px; padding: 3px 8px; cursor: pointer; }
+  #sync-btn:hover { background: #2c2c2c; color: #fff; }
+  #sync-btn:disabled { opacity: .5; cursor: default; }
 
   #playlist-list {
     flex: 1 1 auto; overflow-y: auto; padding: 6px 0;
@@ -89,6 +93,7 @@
   <div id="sidebar" class="collapsed">
     <div id="sidebar-header">
       <div><span>Warteschlange</span><small id="pl-count"></small></div>
+      <button id="sync-btn" title="Playlist sofort mit YouTube abgleichen">↻ Sync</button>
     </div>
     <div id="playlist-list"></div>
   </div>
@@ -144,9 +149,9 @@ function renderPlaylist() {
   document.getElementById("pl-count").textContent =
     items.length ? " · " + items.length + " Songs" : "";
 
-  // Nur neu rendern wenn nötig (Anzahl oder aktiver Index geändert)
+  // Nur neu rendern wenn nötig (Liste oder aktiver Index geändert)
   const prev = list.dataset.rendered;
-  const sig = items.length + ":" + ci;
+  const sig = ci + ":" + items.map((it) => it.item_id).join(",");
   if (prev === sig) return;
   list.dataset.rendered = sig;
 
@@ -189,6 +194,21 @@ function toggleSidebar() {
   toggleBtn.textContent = sidebarOpen ? "✕" : "☰";
 }
 toggleBtn.addEventListener("click", toggleSidebar);
+
+// ---- Sofort-Sync mit YouTube (z.B. nach Löschen im Browser) ----
+const syncBtn = document.getElementById("sync-btn");
+syncBtn.addEventListener("click", async () => {
+  syncBtn.disabled = true;
+  syncBtn.textContent = "…";
+  try {
+    const r = await fetch(api("/api/playlist/sync"), { method: "POST" });
+    const d = await r.json();
+    setStatus(d.ok ? "Synchronisiert: " + d.count + " Songs" : "Sync fehlgeschlagen");
+    await refresh();
+  } catch (e) { setStatus("Sync fehlgeschlagen"); }
+  syncBtn.disabled = false;
+  syncBtn.textContent = "↻ Sync";
+});
 
 // ---- Wiedergabe ----
 function playAt(i) {

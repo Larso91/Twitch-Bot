@@ -177,6 +177,26 @@ class Database:
             c = conn.execute("DELETE FROM queue WHERE yt_item_id = ?", (item_id,))
             return c.rowcount > 0
 
+    def prune_missing_yt_items(self, existing_item_ids, min_age_minutes: int = 10) -> int:
+        """Loescht Queue-Eintraege, deren Song nicht mehr in der YouTube-Playlist ist.
+
+        Z.B. wenn ein Song im Browser direkt aus der Playlist entfernt wurde.
+        Nur Eintraege, die aelter als `min_age_minutes` sind, damit ein gerade
+        erst eingefuegter Song (YouTube braucht teils etwas, bis er gelistet
+        wird) nicht versehentlich verschwindet.
+        """
+        keep = set(existing_item_ids)
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, yt_item_id FROM queue WHERE yt_item_id IS NOT NULL "
+                "AND added_at <= datetime('now', ?)",
+                (f"-{int(min_age_minutes)} minutes",),
+            ).fetchall()
+            gone = [r["id"] for r in rows if r["yt_item_id"] not in keep]
+            for sid in gone:
+                conn.execute("DELETE FROM queue WHERE id = ?", (sid,))
+            return len(gone)
+
     def get_last_by_requester(self, requester: str) -> Optional[Dict]:
         with self._conn() as conn:
             row = conn.execute(

@@ -42,12 +42,11 @@ class Bot(commands.Bot):
         self.db = Database(os.environ.get("DB_PATH", "queue.db"))
         self.channel_name = os.environ["TWITCH_CHANNEL"].lower()
         self.yt_api_key = os.environ.get("YOUTUBE_API_KEY", "")
-        self.max_duration = int(os.environ.get("MAX_SONG_DURATION_MINUTES", "5"))
+        self.max_duration = int(os.environ.get("MAX_SONG_DURATION_MINUTES", "7"))
         # Datei, in die die dauerhaft wachsende Streamliste geschrieben wird.
         self.streamlist_file = os.environ.get("STREAMLIST_FILE", "streamlist.txt")
-        # Zufallsantworten + Emoji-Combos.
+        # Nur noch Emoji-Combos (einmal pro Combo). Zufallsantworten sind raus.
         self.chat = ChatExtras(
-            reply_chance=float(os.environ.get("RANDOM_REPLY_CHANCE", "0.15")),
             combo_threshold=int(os.environ.get("COMBO_THRESHOLD", "3")),
         )
         self._emotes_loaded = False
@@ -59,7 +58,14 @@ class Bot(commands.Bot):
         # nachgefuehrt, damit der Player-Poll NICHT staendig die YouTube-API
         # trifft (Quota!). Eintraege: item_id, video_id, title, requester, url.
         self._pl = []
+        # Voller Abgleich mit YouTube (teurer, mehrere Quota-Einheiten).
         self._pl_sync_seconds = int(os.environ.get("PLAYLIST_SYNC_SECONDS", "300"))
+        # Schneller Aenderungs-Check (nur Anzahl, 1 Quota-Einheit). Erkennt z.B.
+        # im Browser geloeschte Songs innerhalb von ~30 s statt erst nach 5 Min.
+        self._pl_check_seconds = max(10, int(os.environ.get("PLAYLIST_CHECK_SECONDS", "30")))
+        # Zuletzt bekannte Anzahl laut YouTube (fuer den schnellen Check).
+        self._pl_known_count = None
+        self._pl_lock = asyncio.Lock()
         # Wiedergabe-Status vom Player gemeldet (fuer das OBS-Overlay/Restzeit).
         self._now = None  # {video_id, position, duration, playing, ts}
         # Skip-Signal: wird bei !skip / Media_Next hochgezaehlt; der Player
@@ -105,7 +111,7 @@ class Bot(commands.Bot):
             print("Clip-Queue:    AKTIV (Twitch-API: echter Titel + Laenge) -> /clips")
         else:
             print(f"Clip-Queue:    AKTIV ({self.clip_play_seconds}s/Clip, ohne API) -> /clips")
-        print(f"Zufallsantworten: {int(self.chat.reply_chance * 100)}% | Combo ab {self.chat.combo_threshold}")
+        print(f"Emote-Combos:  Ansage einmal ab {self.chat.combo_threshold}x (keine Zufallsantworten)")
         if self.yt_playlist:
             print("YT-Playlist:   AKTIV (Songrequests werden synchronisiert)")
         else:
@@ -143,7 +149,7 @@ class Bot(commands.Bot):
                 self._room_id = room_id
                 asyncio.create_task(self._load_emotes(room_id))
 
-        # Auf Nicht-Befehle reagieren: Emote-Combos & Zufallsantworten.
+        # Auf Nicht-Befehle reagieren: nur noch Emote-Combos.
         if not content.startswith("!") and self.db.get_setting("reactions_enabled", "1") == "1":
             tw_emotes = twitch_emote_names(content, tags.get("emotes"))
             reply = self.chat.process(content, twitch_emotes=tw_emotes)
@@ -222,6 +228,8 @@ class Bot(commands.Bot):
             item_id = await self.yt_playlist.add(video_id, position=pos)
             if item_id:
                 self.db.set_yt_item_id(song_id, item_id)
+                if self._pl_known_count is not None:
+                    self._pl_known_count += 1
                 # Sofort ins In-Memory-Abbild, damit der Player es direkt sieht.
                 self._pl_insert(pos, item_id, video_id, info["title"], ctx.author.name, url)
                 ci = self._current_index()
@@ -247,18 +255,32 @@ class Bot(commands.Bot):
     # ------------------------------------------------------------------ #
 
     async def _playlist_sync_loop(self):
-        """Gleicht das In-Memory-Abbild regelmaessig mit YouTube ab.
+        """Gleicht das In-Memory-Abbild mit YouTube ab.
 
-        Faengt externe Aenderungen ab (z.B. manuell in YouTube editiert) und
-        stellt nach einem Neustart die Liste wieder her. Laeuft selten, um die
-        YouTube-API-Quota zu schonen.
+        - Alle PLAYLIST_CHECK_SECONDS (Standard 30 s): billiger Check der
+          Song-Anzahl. Hat sie sich geaendert (z.B. Song im Browser entfernt),
+          wird sofort komplett neu geladen.
+        - Alle PLAYLIST_SYNC_SECONDS (Standard 300 s): voller Abgleich, faengt
+          auch Umsortierungen im Browser ab.
         """
+        last_full = 0.0
         while True:
             try:
-                await self._reload_playlist_from_yt()
+                due = time.time() - last_full >= self._pl_sync_seconds
+                if not due:
+                    count = await self.yt_playlist.count()
+                    if count is not None and count != self._pl_known_count:
+                        print(
+                            f"Playlist-Aenderung erkannt ({self._pl_known_count} -> {count} "
+                            "Eintraege), lade neu ..."
+                        )
+                        due = True
+                if due:
+                    if await self._reload_playlist_from_yt():
+                        last_full = time.time()
             except Exception as e:
                 print(f"Playlist-Sync Fehler: {e}")
-            await asyncio.sleep(self._pl_sync_seconds)
+            await asyncio.sleep(self._pl_check_seconds)
 
     async def _reload_playlist_from_yt(self):
         """Laedt die echte YouTube-Playlist und reichert sie mit Requester-
@@ -273,7 +295,15 @@ class Bot(commands.Bot):
         SQLite-Queue, dann das bisherige In-Memory-Abbild, zuletzt YouTube
         oEmbed (kein API-Key noetig).
         """
+        async with self._pl_lock:
+            return await self._reload_playlist_locked()
+
+    async def _reload_playlist_locked(self) -> bool:
         items = await self.yt_playlist.list()
+        if items is None:
+            # API-Fehler (Quota/Netz): altes Abbild BEHALTEN statt Playlist leeren.
+            print("Playlist-Sync uebersprungen (YouTube-API nicht erreichbar) – alte Liste bleibt.")
+            return False
         # Bereits bekannte Titel aus dem aktuellen Abbild (per item_id).
         prev_titles = {x["item_id"]: x["title"] for x in self._pl if x.get("title")}
         merged = []
@@ -298,8 +328,23 @@ class Bot(commands.Bot):
                     "url": url,
                 }
             )
+        # Songs, die der Bot selbst gerade erst eingefuegt hat, kurz behalten,
+        # auch wenn YouTube sie noch nicht listet (Propagation dauert teils).
+        listed = {x["item_id"] for x in merged}
+        now_ts = time.time()
+        for i, x in enumerate(self._pl):
+            if x["item_id"] not in listed and now_ts - x.get("added_ts", 0) < 120:
+                merged.insert(min(i, len(merged)), x)
         self._pl = merged
-        print(f"Playlist synchronisiert: {len(merged)} Song(s)")
+        self._pl_known_count = (
+            self.yt_playlist.last_total if self.yt_playlist.last_total is not None else len(items)
+        )
+        # Im Browser geloeschte Songs auch aus der SQLite-Queue entfernen, damit
+        # sie nirgends mehr auftauchen (!queue, !wrongsong, Overlay).
+        pruned = self.db.prune_missing_yt_items(listed)
+        extra = f", {pruned} entfernte(r) Song(s) aus der Queue geloescht" if pruned else ""
+        print(f"Playlist synchronisiert: {len(merged)} Song(s){extra}")
+        return True
 
     def _pl_insert(self, pos, item_id, video_id, title, requester, url):
         """Neuen Song lokal an Position `pos` einfuegen (None/zu gross = ans Ende)."""
@@ -309,6 +354,7 @@ class Bot(commands.Bot):
             "title": title,
             "requester": requester,
             "url": url,
+            "added_ts": time.time(),
         }
         if pos is None or pos >= len(self._pl):
             self._pl.append(entry)
@@ -346,7 +392,8 @@ class Bot(commands.Bot):
         """Entfernt einen Eintrag aus YouTube-Playlist, In-Memory-Abbild und SQLite."""
         if self.yt_playlist:
             try:
-                await self.yt_playlist.remove(item_id)
+                if await self.yt_playlist.remove(item_id) and self._pl_known_count:
+                    self._pl_known_count -= 1
             except Exception as e:
                 print(f"YT-Playlist remove fehlgeschlagen: {e}")
         self._pl = [x for x in self._pl if x["item_id"] != item_id]
@@ -409,6 +456,8 @@ class Bot(commands.Bot):
         app.router.add_get("/api/playlist", self._h_playlist)
         app.router.add_post("/api/playlist/remove", self._h_playlist_remove)
         app.router.add_get("/api/playlist/remove", self._h_playlist_remove)
+        app.router.add_post("/api/playlist/sync", self._h_playlist_sync)
+        app.router.add_get("/api/playlist/sync", self._h_playlist_sync)
         app.router.add_post("/api/finished", self._h_finished)
         app.router.add_post("/api/skip", self._h_skip)
         app.router.add_get("/api/skip", self._h_skip)  # bequem fuer Hotkey-Tools
@@ -624,6 +673,15 @@ class Bot(commands.Bot):
             return web.json_response({"ok": False, "reason": "no-id"})
         await self._remove_playlist_item(item_id)
         return web.json_response({"ok": True, "removed": item_id})
+
+    async def _h_playlist_sync(self, request):
+        """Sofortiger Abgleich mit YouTube (Button im Player / manuell)."""
+        if not self._check_token(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if not self.yt_playlist:
+            return web.json_response({"ok": False, "reason": "no-playlist"})
+        ok = await self._reload_playlist_from_yt()
+        return web.json_response({"ok": ok, "count": len(self._pl)})
 
     async def _h_finished(self, request):
         if not self._check_token(request):
@@ -1138,13 +1196,27 @@ class Bot(commands.Bot):
         mode = (mode or "").strip().lower()
         if mode in ("on", "an", "1"):
             self.db.set_setting("reactions_enabled", "1")
-            await ctx.send("Chat-Reaktionen (Zufallsantworten & Emoji-Combos) AKTIVIERT.")
+            await ctx.send("Emote-Combo-Ansagen AKTIVIERT.")
         elif mode in ("off", "aus", "0"):
             self.db.set_setting("reactions_enabled", "0")
-            await ctx.send("Chat-Reaktionen DEAKTIVIERT.")
+            await ctx.send("Emote-Combo-Ansagen DEAKTIVIERT.")
         else:
             state = "AN" if self.db.get_setting("reactions_enabled", "1") == "1" else "AUS"
-            await ctx.send(f"Chat-Reaktionen sind {state}. Nutze: !reactions on/off")
+            await ctx.send(f"Emote-Combo-Ansagen sind {state}. Nutze: !reactions on/off")
+
+    @commands.command(name="plsync", aliases=["syncpl"])
+    async def plsync(self, ctx: commands.Context):
+        """Mod: Playlist sofort mit YouTube abgleichen (z.B. nach Loeschen im Browser)."""
+        if not (ctx.author.is_mod or ctx.author.is_broadcaster):
+            return
+        if not self.yt_playlist:
+            await ctx.send("Keine YouTube-Playlist konfiguriert.")
+            return
+        ok = await self._reload_playlist_from_yt()
+        if ok:
+            await ctx.send(f"Playlist mit YouTube abgeglichen: {len(self._pl)} Song(s).")
+        else:
+            await ctx.send("YouTube gerade nicht erreichbar – bitte gleich nochmal versuchen.")
 
     @commands.command(name="reloademotes")
     async def reload_emotes(self, ctx: commands.Context):
@@ -1168,7 +1240,7 @@ class Bot(commands.Bot):
         await ctx.send(
             "Nur Mods/Broadcaster: !skip | !clearqueue | !skipclip | !clearclips "
             "| !sron/!sroff (Songrequests an/aus) | !clipon/!clipoff (Clips an/aus) "
-            "| !reactions on/off | !reloademotes | !raffle start/stop/draw/end/cancel "
+            "| !reactions on/off | !plsync | !reloademotes | !raffle start/stop/draw/end/cancel "
             "(Channel-Points-Verlosung) | !autoraffle on/off (automatische Verlosung)"
         )
 
